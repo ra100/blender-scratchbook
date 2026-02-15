@@ -1,0 +1,72 @@
+# AGENTS.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+A scratchbook of Blender experiments — animations, shaders, geometry nodes, and VFX — built with AI assistance. Each experiment lives in its own subfolder. Requires **Blender 4.0+**. No external dependencies beyond Blender's built-in `bpy` and `bmesh`.
+
+## Running Scripts
+
+```bash
+# In Blender's text editor, or from command line:
+blender --python <experiment>/script.py
+
+# On an existing .blend file:
+blender myfile.blend --python <experiment>/script.py
+```
+
+## Working with Blender MCP
+
+When a Blender MCP server is connected, build and modify node trees directly via `mcp__blender__execute_blender_code`. Keep code chunks small — Blender MCP has execution timeouts. Always re-fetch node/link references after removing nodes (Python references invalidate on deletion).
+
+## Repository Structure
+
+```
+<experiment-name>/
+  *.py                — Blender Python scripts
+  docs/
+    brainstorms/      — Initial design exploration and decisions
+    plans/            — Detailed technical implementation plans
+    learnings/        — Post-implementation notes, deviations, API gotchas
+```
+
+Learnings docs are the most valuable reference — they capture what actually worked vs. what was planned, plus replication guides.
+
+## Critical Blender API Gotchas
+
+These are hard-won lessons — do not retry these failed approaches:
+
+- **Instance Scale on Collection Info instances always returns (1,1,1).** Use a separate modifier on source objects to write a named attribute instead.
+- **Empties produce no geometry after Realize Instances.** Actuators must be single-vertex mesh objects (create via bmesh).
+- **Capture Attribute anonymous attributes don't survive Realize Instances.** Use `Store Named Attribute` with explicit string names.
+- **Blur Attribute has no Geometry input** in Blender 4.x. It operates on context geometry implicitly.
+- **Group Input sockets cannot connect directly to nodes inside a Simulation Zone body** — evaluation silently produces zeros. Route values through Simulation Zone as **pass-through state items**: `Group Input → Sim Input[StateItem] → internal node` + `Sim Input[StateItem] → Sim Output[StateItem]`.
+- **Blender 4.x uses layered actions.** Keyframe access: `action.layers[].strips[].channelbags[].fcurves`, not `action.fcurves`.
+- **Node link removal invalidates Python references.** Always iterate over `list(ng.links)` copies and re-fetch node references after removal.
+- **`display_type = 'PLAIN_AXES'` is invalid for mesh objects.** Use `'WIRE'` instead.
+- **Vector Math SCALE float input is at socket index 3**, not index 1.
+
+## Conventions
+
+- Each experiment gets its own subfolder with docs
+- Keyframe animations use **CONSTANT interpolation** unless smooth easing is explicitly needed
+- Document learnings after each experiment, especially deviations from the plan and API surprises
+
+## Commit Messages
+
+Use **Conventional Commits** format with a **gitmoji** prefix:
+
+```
+<emoji> <type>: <description>
+```
+
+Examples:
+- `✨ feat: add shield ripple wave equation`
+- `🐛 fix: correct velocity decay inside sim zone`
+- `📝 docs: document Blender API gotchas`
+- `♻️ refactor: extract injection pipeline into helper`
+- `🚚 chore: move files to subfolder`
+- `🎉 feat: initial project setup`
+
+Common gitmoji: ✨ feat, 🐛 fix, 📝 docs, ♻️ refactor, 🚚 chore, 🎨 style, ⚡ perf, 🔧 config, 🗑️ remove
