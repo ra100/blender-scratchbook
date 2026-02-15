@@ -28,22 +28,32 @@ All tunable parameters exposed as modifier inputs, routed through the Simulation
 ### Architecture
 
 ```
-Controller Object (single-vertex mesh)
+Each torpedo start object (single-vertex mesh):
+  └── GeoNodes Modifier: "TorpedoActivation"
+        Self Object → Object Info → Scale → Length → Compare (> threshold)
+        → Store Named Attribute "active" (FLOAT, POINT)
+
+Controller Object (single-vertex mesh):
   └── GeoNodes Modifier: "TorpedoEffect"
         ├── Group Inputs (parameters)
-        ├── Collection Info → torpedo start positions
+        ├── Collection Info → torpedo start positions + "active" attribute
         ├── Object Info (Target) → target position
         ├── Repulsor force computation (OUTSIDE sim zone)
         ├── Simulation Zone
         │     ├── State: Position (VECTOR per torpedo)
         │     ├── State: Velocity (VECTOR per torpedo)
-        │     ├── State: Arrived (FLOAT per torpedo — 1.0 after arrival → freeze)
+        │     ├── State: Active (FLOAT — read from "active" attr, latches launch)
+        │     ├── State: Arrived (FLOAT — 1.0 when reached target)
         │     ├── Pass-through states for parameters
-        │     ├── Physics: attraction + repulsion + clamping
+        │     ├── Physics: attraction + repulsion + clamping (only when Active & !Arrived)
         │     └── Position update
-        ├── Instance on Points (torpedo mesh)
+        ├── Instance on Points (torpedo mesh) — only Active & !Arrived torpedoes
         └── Output geometry
 ```
+
+**Per-torpedo launch timing:** Each torpedo start object's **scale** controls when it launches. Keyframe scale from 0 → 1 on the frame you want that torpedo to fire. The TorpedoActivation modifier (same proven pattern from shield-animation) reads the scale and writes an "active" named attribute. The main TorpedoEffect modifier reads this attribute to decide when to start simulating each torpedo.
+
+**Arrival behavior:** When a torpedo reaches the target (within arrival distance), `Arrived` latches to 1.0. Arrived torpedoes are **not instanced** — they disappear (light goes off). No freeze, no lingering geometry.
 
 ### Simulation Zone State Items
 
@@ -53,9 +63,11 @@ Core states use bare names; pass-through parameters use the `Param` suffix to di
 | ----------------------- | ------ | ------------------------------------------- |
 | Position                | VECTOR | Current world position of each torpedo      |
 | Velocity                | VECTOR | Current velocity vector                     |
+| Active                  | FLOAT  | 1.0 once torpedo has launched (latched from "active" attr) |
 | Arrived                 | FLOAT  | 1.0 when within arrival threshold of target |
 | AttractionParam         | FLOAT  | Pass-through for Attraction strength        |
 | MaxSpeedParam           | FLOAT  | Pass-through for Max Speed                  |
+| InitialSpeedParam       | FLOAT  | Pass-through for Initial Speed              |
 | RepulsorStrengthParam   | FLOAT  | Pass-through for Repulsor Strength          |
 | RepulsorRadiusParam     | FLOAT  | Pass-through for Repulsor Radius            |
 | TargetPosParam          | VECTOR | Pass-through for target world position      |
@@ -91,11 +103,26 @@ The Simulation Zone's built-in **Delta Time** output socket (on the Simulation Z
 ### Per-Frame Physics (inside Simulation Zone)
 
 ```
-# Skip physics if torpedo has arrived
-if Arrived == 1.0:
-    Position = Position  (freeze)
+# Read "active" named attribute from geometry (set by TorpedoActivation modifier)
+active_now = Named Attribute "active"
+
+# Latch Active state: once a torpedo launches, it stays active forever
+Active = max(Active, active_now)
+
+# Skip physics if not yet launched
+if Active == 0.0:
+    Position = start_position  (stay at spawn point)
     Velocity = (0,0,0)
     → skip to output
+
+# Skip physics if torpedo has arrived at target
+if Arrived == 1.0:
+    → skip to output (torpedo will not be instanced — it's gone)
+
+# On first frame of activation (Active just became 1.0):
+#   Initialize Velocity = normalize(TargetPos - Position) × InitialSpeedParam
+# This gives the torpedo a launch impulse toward the target.
+# Detect via: Active == 1.0 AND length(Velocity) == 0.0
 
 # 1. Target attraction
 to_target = TargetPosParam - Position
@@ -136,10 +163,11 @@ When `dist >= RepulsorRadiusParam`, force is zero (smooth, no hard cutoff jitter
 These are the non-obvious details to watch for during MCP build:
 
 - **Vector Math SCALE**: float input is socket index 3, not index 1
-- **Arrival latching**: use Math MAXIMUM(previous_arrived, just_arrived) — once arrived, stays arrived
+- **Active/Arrived latching**: use Math MAXIMUM(previous_state, new_state) — once latched, stays latched
 - **Arrived velocity mask**: Mix (Vector) with factor=Arrived, A=clamped_velocity, B=(0,0,0) — factor=1 returns B
 - **Zero velocity normalize**: `normalize((0,0,0))` returns `(0,0,0)` in Blender (safe, not NaN)
-- **Initial velocity**: On frame 1, Velocity starts at (0,0,0) — torpedo accelerates from rest via attraction force. No explicit Initial Speed needed.
+- **Launch impulse**: On the first active frame, Velocity is (0,0,0). Detect this to apply InitialSpeed as `normalize(target - pos) × InitialSpeed`. After that frame, Velocity > 0 so the impulse doesn't re-fire.
+- **Instancing filter**: After sim zone, use `Active AND NOT Arrived` to control which torpedoes get instanced. Inactive torpedoes are invisible (not yet launched). Arrived torpedoes are invisible (hit target, light off).
 
 ### Modifier Parameters (Group Inputs)
 
@@ -150,6 +178,7 @@ These are the non-obvious details to watch for during MCP build:
 | Repulsors         | Collection | —       | Collection of obstacle objects         |
 | Attraction        | Float      | 5.0     | Target-seeking force strength          |
 | Max Speed         | Float      | 10.0    | Maximum velocity magnitude             |
+| Initial Speed     | Float      | 2.0     | Launch impulse speed toward target     |
 | Repulsor Strength | Float      | 50.0    | Avoidance force multiplier             |
 | Repulsor Radius   | Float      | 5.0     | Influence distance of repulsors        |
 
@@ -181,13 +210,16 @@ Build the complete torpedo flight system with a single torpedo, no repulsors.
 
 **Build:**
 - Scene setup: controller object, Torpedoes collection with single-vertex mesh start object, target object
-- GeoNodes modifier with Group Inputs (Target, Attraction, Max Speed)
-- Simulation Zone with Position, Velocity, Arrived states + parameter pass-throughs
+- TorpedoActivation modifier on each torpedo start object (Self Object → Scale → "active" attribute)
+- GeoNodes modifier with Group Inputs (Target, Attraction, Max Speed, Initial Speed)
+- Simulation Zone with Position, Velocity, Active, Arrived states + parameter pass-throughs
+- Activation detection (read "active" attr, latch Active state)
+- Launch impulse (InitialSpeed toward target on first active frame)
 - Target attraction → velocity update → speed clamping → position update → arrival detection
-- Set Position + Instance on Points (icosphere)
+- Instance on Points with visibility filter: only `Active AND NOT Arrived` torpedoes
 - TorpedoEmission material
 
-**Validate:** Play animation — torpedo flies from start toward target, decelerates near target, freezes on arrival, glows.
+**Validate:** Keyframe torpedo scale from 0→1 at frame 10. Torpedo should appear at frame 10, fly toward target with initial impulse, then disappear on arrival.
 
 ### Phase 2: Repulsor Avoidance
 
@@ -206,12 +238,12 @@ Add repulsor force computation (outside sim zone) and wire into the physics.
 
 | Question | Decision | Rationale |
 | --- | --- | --- |
-| Arrival behavior | Freeze position + velocity, remain visible | Simplest; explosion/disappear can be added later |
+| Arrival behavior | Torpedo disappears (not instanced) | Arrived=1.0 excludes from instancing — light goes off cleanly |
+| Per-torpedo launch timing | Scale-based activation (keyframeable) | TorpedoActivation modifier reads object scale; keyframe scale 0→1 to fire. Proven pattern from shield-animation. |
+| Initial speed | Parameter (default 2.0) | Launch impulse toward target on first active frame; needed for natural-looking launch |
 | Trail | Cut from plan | YAGNI — add as separate plan if base effect works well |
 | Multiple targets | Single shared target | Per-torpedo targets need vector attributes on collection objects; defer |
-| Activation timing | All launch simultaneously | Staggered launch adds complexity; can use scale-based activation later |
 | Point lights | Skip — use emission + bloom | GeoNodes can't instance light objects; emission is sufficient |
-| Initial speed | Hardcoded at 0 (accelerate from rest) | Attraction force dominates quickly; removes a parameter |
 | Repulsor falloff | Linear instead of inverse-square | No singularity, smooth boundary, simpler nodes |
 
 ## Known Constraints & Workarounds
@@ -233,11 +265,11 @@ From `AGENTS.md` and shield-animation learnings:
 
 Build via `mcp__blender__execute_blender_code` in small chunks. Each chunk produces a testable result. Re-fetch node references between chunks.
 
-1. **Scene setup:** Create controller object, Torpedoes collection with single-vertex mesh start objects, target object, Repulsors collection
-2. **Node tree skeleton:** GeoNodes modifier, Group Inputs, Simulation Zone with all state items, parameter pass-throughs wired
-3. **Physics:** Target attraction + velocity update + speed clamping + arrival detection — all in one chunk (these are interdependent)
+1. **Scene setup:** Create controller object, Torpedoes collection with single-vertex mesh start objects, target object, Repulsors collection. Apply TorpedoActivation modifier to each torpedo start object. Add scale keyframes for launch timing.
+2. **Node tree skeleton:** GeoNodes modifier, Group Inputs, Simulation Zone with all state items (Position, Velocity, Active, Arrived + param pass-throughs), parameter routing wired
+3. **Physics:** Activation detection + launch impulse + target attraction + velocity update + speed clamping + arrival detection — all in one chunk (these are interdependent)
 4. **Repulsors:** Collection Info + Realize outside sim zone, Geometry Proximity, linear falloff force, wire RepulsorForceParam into sim zone
-5. **Instancing + visuals:** Set Position, Instance on Points, TorpedoEmission material creation + assignment
+5. **Instancing + visuals:** Set Position, filter points by `Active AND NOT Arrived`, Instance on Points, TorpedoEmission material creation + assignment
 
 ## References
 
