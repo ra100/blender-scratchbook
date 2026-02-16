@@ -41,8 +41,8 @@ These are hard-won lessons — do not retry these failed approaches:
 - **Empties produce no geometry after Realize Instances.** Actuators must be single-vertex mesh objects (create via bmesh).
 - **Capture Attribute anonymous attributes don't survive Realize Instances.** Use `Store Named Attribute` with explicit string names.
 - **Blur Attribute has no Geometry input** in Blender 4.x. It operates on context geometry implicitly.
-- **Group Input values do not propagate reliably to ANY downstream node** when modifier overrides are set. This affects Simulation Zone body nodes, Collection Info nodes, and potentially all node types. The node receives the *interface default*, not the modifier override. **Workaround:** hardcode values directly on consuming node input sockets, or set `sim_in` socket defaults. Do not rely on Group Input connections for runtime values.
-- **Object Info nodes inside Simulation Zones produce incorrect/zero values.** Location, Scale, and other outputs return wrong data. **Workaround:** use hardcoded `Combine XYZ` nodes for known positions, or `Scene Time` for frame-based triggers.
+- **Group Input values propagate correctly to nodes OUTSIDE the Simulation Zone** but **NOT to nodes INSIDE the Simulation Zone**. Interior nodes receive the interface default, not the modifier override. **Workaround:** use pass-through state items: `Group Input → sim_in state input → sim_in state output → consuming node + sim_out state input`. This routes the modifier override value through the sim zone's state system. For nodes outside the sim zone, Group Input connections work directly.
+- **Object Info nodes inside Simulation Zones DO work correctly** when the object reference is set directly on the node socket (not through Group Input) and `transform_space = 'ORIGINAL'`. Earlier reports of incorrect values were caused by corrupted node trees or Group Input routing. Object Info reads live scene positions each frame.
 - **Scene Time works correctly inside Simulation Zones** — use it for frame-based activation instead of Object Info or Named Attributes.
 - **Simulation Zone geometry freezes after frame 1.** Named Attributes on the geometry (set by external modifiers) do not update inside the sim zone on subsequent frames. External per-frame data cannot enter the sim zone through geometry attributes.
 - **`ShaderNodeMath` has no `GREATER_EQUAL` operation.** Use `GREATER_THAN` with threshold adjusted by -0.5 for integer comparisons.
@@ -51,6 +51,8 @@ These are hard-won lessons — do not retry these failed approaches:
 - **Node link removal invalidates Python references.** Always iterate over `list(ng.links)` copies and re-fetch node references after removal.
 - **`display_type = 'PLAIN_AXES'` is invalid for mesh objects.** Use `'WIRE'` instead.
 - **Vector Math SCALE float input is at socket index 3**, not index 1.
+- **Simulation Zone state items use `'VECTOR'`**, not `'FLOAT_VECTOR'`, in `state_items.new()`.
+- **GeoNodes visibility control**: Use Delete Geometry nodes to output empty geometry instead of `hide_viewport`/`hide_render` flags. For always-hidden objects, apply a GeoNodes modifier that deletes all points.
 
 ## Conventions
 

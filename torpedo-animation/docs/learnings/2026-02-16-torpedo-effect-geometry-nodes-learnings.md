@@ -4,45 +4,56 @@
 
 ## Summary
 
-Built a Geometry Nodes torpedo simulation with target-seeking physics, repulsor avoidance, and emission visuals. Two torpedoes launch at different times, fly toward separate targets, one curves around a repulsor, both disappear on arrival.
+Built a Geometry Nodes torpedo simulation with target-seeking physics, repulsor avoidance, and emission visuals. Two torpedoes launch at different times, fly toward separate targets, one curves around a repulsor, both disappear on arrival. Everything runs inside Geometry Nodes — no Python frame handlers.
 
-## Critical Discovery: Group Input → Anything = Silent Zeros
+## Group Input Propagation: Nuanced Behavior
 
-The single most important learning from this project extends the silent-zeros bug documented in shield-animation:
+**Group Input values propagate correctly to nodes OUTSIDE the Simulation Zone** — modifier override values appear on consuming nodes as expected.
 
-**Group Input values do NOT propagate to ANY downstream node when the modifier has override values.** This affects:
+**Group Input values do NOT propagate to nodes INSIDE the Simulation Zone.** Nodes inside the sim zone receive the interface default, not the modifier override. This affects:
 
-1. **Group Input → Simulation Zone body nodes** (known from shield-animation)
-2. **Group Input → Collection Info nodes** (NEW — discovered in this project)
-3. **Group Input → any node when modifier overrides are set** (suspected — the bug may be universal)
+1. **Group Input → Simulation Zone body nodes** (confirmed)
+2. **Group Input → Collection Info inside sim zone** (confirmed)
 
-The modifier panel shows correct override values (e.g., Attraction=100), but the Group Input node outputs the *interface default* (e.g., 5.0), not the modifier override. This means **all Group Input connections are unreliable.**
+### Workaround: Pass-Through State Items
 
-### Workaround: Hardcode Everything
+Instead of connecting Group Inputs directly to nodes inside the sim zone, use state items as pass-throughs:
 
-For this project, every parameter and reference was hardcoded directly on node input sockets:
+```
+Group Input[Param] → sim_in.inputs[ParamState]     (external entry)
+sim_in.outputs[ParamState] → consuming_node          (use the value)
+sim_in.outputs[ParamState] → sim_out.inputs[ParamState]  (pass-through)
+```
 
-- **Collection references**: Set `Collection Info.inputs['Collection'].default_value = collection` directly (not through Group Input)
-- **Float parameters**: Set directly as `node.inputs[N].default_value = value` on the consuming node
-- **Object positions**: Use `Combine XYZ` nodes with hardcoded coordinates instead of `Object Info` nodes
-- **Activation timing**: Use `Scene Time` node with hardcoded frame thresholds instead of external object scale reads
+This was tested and confirmed working — modifier override values (e.g., Attraction=400) propagate correctly through state items to consuming nodes inside the sim zone.
 
-This eliminates Group Inputs entirely. The downside is that changing parameters requires editing the node tree (or Python script), not the modifier panel.
+For nodes **outside** the sim zone (e.g., TorpedoSphere.Radius), Group Input connections work directly without state items.
 
-## Object Info Nodes Inside Simulation Zones
+### Alternative: Hardcode on Node Sockets
 
-**Object Info nodes inside Simulation Zones produce incorrect/zero values.** Tested with both torpedo object references (for activation) and repulsor object references (for position). The Location output returned wrong coordinates.
+For values that don't need user-tuning, set directly on consuming node input sockets:
+- **Float parameters**: `node.inputs[N].default_value = value`
+- **Collection references**: `coll_info.inputs['Collection'].default_value = collection`
+- **Object references**: `obj_info.inputs['Object'].default_value = obj`
 
-### Workaround
+## CORRECTION: Object Info DOES Work Inside Simulation Zones
 
-Replace Object Info with hardcoded Combine XYZ nodes for known positions. For activation timing, use Scene Time frame checks instead of reading object scale.
+**Previous claim was wrong.** Object Info nodes inside Simulation Zones **DO produce correct values** when:
+- The object reference is set directly on the node socket (not through Group Input)
+- The `transform_space` is set to `'ORIGINAL'`
+
+Tested: Object Info for Target1 inside a Simulation Zone returned the correct world position at all frames, including after the target was moved in the viewport. This was verified with Store Named Attribute debugging.
+
+The earlier failures were likely caused by corrupted node trees from extensive modification, or by routing the object reference through Group Input (which hits the silent zeros bug).
+
+**This means the animation IS driven by scene objects:** moving Target1, Target2, or Repulsor1 in the viewport changes torpedo trajectories without any Python code running.
 
 ## Scene Time Works Inside Simulation Zones
 
-Unlike Group Inputs and Object Info, the **Scene Time** node produces correct Frame and Seconds values inside Simulation Zones. This makes it useful for frame-based activation triggers:
+The **Scene Time** node produces correct Frame and Seconds values inside Simulation Zones. Used for frame-based activation triggers:
 
 ```
-Scene Time[Frame] → Math(GREATER_THAN, threshold=9.5) → activation signal
+Scene Time[Frame] → Math(GREATER_THAN, threshold=launch_frame - 0.5) → activation signal
 ```
 
 Note: Math node has no `GREATER_EQUAL` operation. Use `GREATER_THAN` with threshold - 0.5.
@@ -51,9 +62,7 @@ Note: Math node has no `GREATER_EQUAL` operation. Use `GREATER_THAN` with thresh
 
 The geometry entering a Simulation Zone on frame 1 becomes the sim zone's internal geometry for all subsequent frames. External changes to source objects (like Named Attributes updated by other modifiers) do NOT propagate into the sim zone after initialization.
 
-This means:
-- Named Attributes set by TorpedoActivation modifier on torpedo objects are **frozen at frame 1 values** inside the sim zone
-- Any per-frame dynamic data must come from nodes that evaluate inside the sim zone (Scene Time, math operations on state items)
+Named Attributes stored on geometry BEFORE the sim zone are NOT available inside the sim zone on subsequent frames — only standard attributes (`position`, `.edge_verts`, etc.) survive.
 
 ## Per-Point Data Selection Pattern
 
@@ -64,22 +73,15 @@ Index → Compare(INT, EQUAL, B=0) → is_T1 (boolean)
 Mix(Factor=is_T1, A=value_for_T2, B=value_for_T1) → per_point_value
 ```
 
-Note: Mix node with factor=0 returns A, factor=1 returns B. This is inverted from what you might expect.
+Note: Mix node with factor=0 returns A, factor=1 returns B.
 
 ## Set Position Required After Simulation Zone
 
-The Simulation Zone's `Position` state item tracks torpedo positions mathematically, but **does not move the actual geometry vertices**. A `Set Position` node must be added after the sim zone output to apply the computed positions to the geometry.
-
-## `to_mesh()` Returns Post-Modifier Geometry
-
-When evaluating with `to_mesh()`:
-- If the GeoNodes modifier produces instanced geometry (Instance on Points → Realize), `to_mesh()` returns the realized mesh with all instance vertices
-- A UV Sphere with 16 segments × 8 rings = 114 vertices per instance
-- 0 verts means the modifier is outputting empty geometry (useful for detecting broken node trees)
+The Simulation Zone's `Position` state item tracks torpedo positions mathematically, but **does not move the actual geometry vertices**. A `Set Position` node must be added after the sim zone output.
 
 ## Position Initialization Pattern
 
-On frame 1, the Simulation Zone's `Position` state item defaults to (0,0,0), not the actual vertex position. This causes torpedoes to teleport to the origin on the first sim frame. Fix with:
+On frame 1, the Simulation Zone's `Position` state item defaults to (0,0,0), not the actual vertex position. Fix with:
 
 ```
 start_pos = Position node (reads actual vertex position from geometry)
@@ -87,6 +89,17 @@ pos_select = Mix(Factor=Active, A=start_pos, B=computed_new_pos)
 ```
 
 When Active=0, torpedo stays at its geometry position. When Active=1, it uses the simulation-computed position.
+
+## Visibility via Delete Geometry (Not hide_viewport/hide_render)
+
+Do NOT use `obj.hide_viewport` or `obj.hide_render` for controlling torpedo visibility. Instead:
+- Use **Delete Geometry** node in GeoNodes to output empty geometry when hidden
+- Post-sim visibility filter: `Active * (1 - Arrived)` → invert → Delete Geometry selection
+- For always-hidden objects (instance sources, markers), use a GeoNodes modifier that deletes all points
+
+## Instancing with GeoNodes Primitives
+
+When the instance source object has a GeoNodes modifier that modifies its geometry (e.g., an AlwaysHidden delete modifier), Object Info returns the post-modifier geometry (0 verts). Use a **Mesh UV Sphere** primitive node instead of referencing an external object for instancing.
 
 ## Speed Clamping with Safe Division
 
@@ -103,7 +116,7 @@ Blender's Math DIVIDE returns 0 for 0/0, which is safe for the zero-velocity cas
 ## Arrival Latching
 
 ```
-arrival_check = dist_to_target < threshold   # returns 0.0 or 1.0
+arrival_check = dist_to_target < threshold
 Arrived = Maximum(previous_Arrived, arrival_check)  # once 1.0, stays 1.0
 ```
 
@@ -116,22 +129,29 @@ active_mask = Active * (1.0 - Arrived)
 final_vel = Scale(clamped_vel, active_mask)
 ```
 
-This zeros velocity when inactive (not yet launched) OR arrived (reached target).
+Zeros velocity when inactive (not yet launched) OR arrived (reached target).
 
-## Linear Repulsor Falloff
+## Linear Repulsor Falloff with Pass-Through Gate
 
 ```
 away = torpedo_position - repulsor_position
 dist = Length(away)
 falloff = Max(0, 1 - dist / RepulsorRadius)
 repulse_force = Normalize(away) * RepulsorStrength * falloff
+
+# Gate: only apply repulsor when torpedo hasn't passed it yet
+dist_rep_to_target = Length(target_pos - repulsor_pos)
+gate = dist_to_target > dist_rep_to_target   # 1 if torpedo is farther, 0 if passed
+gated_force = repulse_force * gate
 ```
 
-Linear falloff is smooth at the boundary (no jitter) and has no singularity at zero distance. The force direction is always "away from repulsor."
+The gate check (`dist(torpedo,target) > dist(repulsor,target)`) makes the repulsor behave like a shield — it deflects approaching torpedoes but has no effect once they've flown past it.
+
+Linear falloff is smooth at the boundary and has no singularity at zero distance.
 
 ## Parameter Values That Worked
 
-For a scene with 600m torpedo-to-target distance, 50m torpedo spacing:
+For a scene with ~770m torpedo-to-target distance, 50m torpedo spacing:
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -141,28 +161,56 @@ For a scene with 600m torpedo-to-target distance, 50m torpedo spacing:
 | Repulsor Strength | 100.0 | Lower than attraction to avoid orbiting |
 | Repulsor Radius | 150.0 | Wide influence zone |
 | Arrival Distance | 20.0 | Generous to account for trajectory offset |
-| Torpedo Mesh Radius | 10.0 | Visible at 1400m scene scale |
+| Torpedo Mesh Radius | 10.0 | Visible at scene scale |
 
-Key ratio: **Attraction should be ~2× Repulsor Strength** to ensure torpedoes converge rather than orbit.
+Key ratio: **Attraction should be ~2× Repulsor Strength** to ensure torpedoes converge.
 
 ## Blender API Notes
 
 - `ShaderNodeMath` operations: No `GREATER_EQUAL`. Use `GREATER_THAN` with adjusted threshold.
-- `FunctionNodeCompare`: Supports `GREATER_THAN` for float comparison, `EQUAL` for int. Has separate input sockets for INT (indices 2,3) and FLOAT (A, B by name).
-- `ShaderNodeMix`: `data_type='VECTOR'` for vector mixing, `'FLOAT'` for scalar. Inputs are `Factor`, `A`, `B`.
-- Vector Math SCALE: Float input is **socket index 3** (not 1). Still true.
-- `Collection Info.transform_space = 'ORIGINAL'` to get world positions from collection objects.
+- `FunctionNodeCompare`: Supports `GREATER_THAN` for float, `EQUAL` for int. INT inputs at socket indices 2,3.
+- `ShaderNodeMix`: `data_type='VECTOR'` for vector mixing. Vector inputs at indices 4 (A), 5 (B).
+- Vector Math SCALE: Float input is **socket index 3**.
+- Sim zone state items: use `'VECTOR'` not `'FLOAT_VECTOR'` for the `new()` call.
+- `Object Info.transform_space = 'ORIGINAL'` for world positions.
 - Render engine enum: `'BLENDER_EEVEE'` (not `'BLENDER_EEVEE_NEXT'`).
+- `material.surface_render_method = 'BLENDED'` for EEVEE emission.
+
+## Architecture: Final Working Design
+
+```
+TorpedoController (2-vertex mesh, one per torpedo)
+  └── TorpedoEffect GeoNodes Modifier
+        ├── Group Inputs: Attraction, Max Speed, Initial Speed,
+        │   Repulsor Strength Base, Repulsor Radius, Arrival Distance, Torpedo Radius
+        ├── Object Info nodes for Target1, Target2, Repulsor1 (INSIDE sim zone)
+        │   → reads actual scene positions, updates when objects are moved
+        ├── Scene Time for activation frame detection
+        ├── Index + Compare + Mix for per-torpedo selection
+        ├── Simulation Zone
+        │     ├── State: Position, Velocity, Active, Arrived
+        │     ├── Pass-through states: AttractionParam, MaxSpeedParam, InitialSpeedParam,
+        │     │   RepStrengthBaseParam, RepRadiusParam, ArrivalDistParam
+        │     ├── Physics: attraction + repulsion + speed clamping
+        │     ├── Launch impulse on first active frame
+        │     └── Active/Arrived masking
+        ├── Set Position
+        ├── Delete Geometry (inactive/arrived torpedoes)
+        ├── Instance on Points (UV Sphere primitive, radius from Group Input)
+        ├── Realize Instances
+        └── Set Material (TorpedoEmission)
+```
 
 ## Deviations from Plan
 
 | Plan | Actual | Reason |
 |------|--------|--------|
-| Group Inputs for parameters | All hardcoded on nodes | Group Input → node values are unreliable (silent zeros) |
-| Collection Input through Group Input | Direct collection reference on Collection Info | Same bug — Group Input doesn't propagate collection overrides |
-| Object Info for activation | Scene Time frame checks | Object Info produces wrong values inside Simulation Zone |
-| Object Info for repulsor position | Hardcoded Combine XYZ | Same Object Info bug |
-| Pass-through state items for params | Removed entirely | Not needed when values are hardcoded |
-| TorpedoActivation modifier for activation | Kept but unused by main effect | Main effect uses Scene Time instead |
-| Single shared target | Per-torpedo targets via Index+Mix | Required by 2-torpedo, 2-target setup |
-| Repulsor computed outside sim zone | Hardcoded position inside sim zone | Object positions from outside don't propagate correctly |
+| Group Inputs directly to nodes | Group Inputs via state item pass-throughs | Group Input → sim zone interior nodes = silent zeros; pass-throughs work |
+| Object Info outside sim zone | Object Info INSIDE sim zone | Works correctly when object ref is set directly on the node |
+| Pass-through state items for params | Not needed | Object Info inside sim zone provides live positions |
+| Repulsor computed outside sim zone | Computed inside sim zone | Object Info works inside, no need for external computation |
+| TorpedoActivation modifier for launch | Scene Time frame checks | Simpler, no external modifier needed |
+| Python frame handler for physics | Pure GeoNodes Simulation Zone | User requirement: no Python during simulation |
+| hide_viewport/hide_render for visibility | Delete Geometry in GeoNodes | User requirement: visibility through geometry output only |
+| Separate TorpedoVisual objects | Single TorpedoController outputs everything | User requirement: all visuals from one controller |
+| External object for instance source | GeoNodes Mesh UV Sphere primitive | External object's geometry was modified by AlwaysHidden modifier |
