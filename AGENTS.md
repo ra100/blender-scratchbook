@@ -41,7 +41,12 @@ These are hard-won lessons — do not retry these failed approaches:
 - **Empties produce no geometry after Realize Instances.** Actuators must be single-vertex mesh objects (create via bmesh).
 - **Capture Attribute anonymous attributes don't survive Realize Instances.** Use `Store Named Attribute` with explicit string names.
 - **Blur Attribute has no Geometry input** in Blender 4.x. It operates on context geometry implicitly.
-- **Group Input sockets cannot connect directly to nodes inside a Simulation Zone body** — evaluation silently produces zeros. Route values through Simulation Zone as **pass-through state items**: `Group Input → Sim Input[StateItem] → internal node` + `Sim Input[StateItem] → Sim Output[StateItem]`.
+- **Group Input values do not propagate reliably to ANY downstream node** when modifier overrides are set. This affects Simulation Zone body nodes, Collection Info nodes, and potentially all node types. The node receives the *interface default*, not the modifier override. **Workaround:** hardcode values directly on consuming node input sockets, or set `sim_in` socket defaults. Do not rely on Group Input connections for runtime values.
+- **Object Info nodes inside Simulation Zones produce incorrect/zero values.** Location, Scale, and other outputs return wrong data. **Workaround:** use hardcoded `Combine XYZ` nodes for known positions, or `Scene Time` for frame-based triggers.
+- **Scene Time works correctly inside Simulation Zones** — use it for frame-based activation instead of Object Info or Named Attributes.
+- **Simulation Zone geometry freezes after frame 1.** Named Attributes on the geometry (set by external modifiers) do not update inside the sim zone on subsequent frames. External per-frame data cannot enter the sim zone through geometry attributes.
+- **`ShaderNodeMath` has no `GREATER_EQUAL` operation.** Use `GREATER_THAN` with threshold adjusted by -0.5 for integer comparisons.
+- **Set Position required after Simulation Zone.** Position state items track values mathematically but do not move geometry vertices. Add an explicit Set Position node after sim zone output.
 - **Blender 4.x uses layered actions.** Keyframe access: `action.layers[].strips[].channelbags[].fcurves`, not `action.fcurves`.
 - **Node link removal invalidates Python references.** Always iterate over `list(ng.links)` copies and re-fetch node references after removal.
 - **`display_type = 'PLAIN_AXES'` is invalid for mesh objects.** Use `'WIRE'` instead.
