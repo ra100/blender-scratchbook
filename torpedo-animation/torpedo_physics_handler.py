@@ -132,7 +132,7 @@ def _build_cascading_mux(nodes, links, per_torpedo_sockets, data_type,
     """Build a cascading Index+Compare+Mix chain for per-torpedo selection.
 
     per_torpedo_sockets: list of sockets, one per torpedo (e.g. target positions)
-    data_type: 'VECTOR' or 'FLOAT'
+    data_type: 'VECTOR', 'FLOAT', or 'ROTATION'
     Returns the result socket that holds the correct value per point.
     """
     if len(per_torpedo_sockets) == 1:
@@ -162,14 +162,16 @@ def _build_cascading_mux(nodes, links, per_torpedo_sockets, data_type,
         mix.clamp_factor = True
         _link(links, compare.outputs['Result'], mix.inputs['Factor'])
 
-        if data_type == 'VECTOR':
-            _link(links, result_socket, mix.inputs[4])  # A
-            _link(links, per_torpedo_sockets[i], mix.inputs[5])  # B
-            result_socket = mix.outputs[1]  # Vector Result
-        else:
-            _link(links, result_socket, mix.inputs[2])  # A
-            _link(links, per_torpedo_sockets[i], mix.inputs[3])  # B
-            result_socket = mix.outputs[0]  # Float Result
+        # ShaderNodeMix socket indices by data_type:
+        #   FLOAT:    A=2, B=3, Result=0
+        #   VECTOR:   A=4, B=5, Result=1
+        #   RGBA:     A=6, B=7, Result=2
+        #   ROTATION: A=8, B=9, Result=3
+        ab_out = {'FLOAT': (2, 3, 0), 'VECTOR': (4, 5, 1),
+                  'ROTATION': (8, 9, 3)}[data_type]
+        _link(links, result_socket, mix.inputs[ab_out[0]])
+        _link(links, per_torpedo_sockets[i], mix.inputs[ab_out[1]])
+        result_socket = mix.outputs[ab_out[2]]
 
     return result_socket
 
@@ -203,9 +205,9 @@ def _build_launch(nodes, links, lp_scale_sockets, lp_rotation_sockets,
         "LPScale", x, y_offset=-200,
     )
 
-    # --- Per-torpedo launchpad rotation (via cascading mux) ---
+    # --- Per-torpedo launchpad rotation (via cascading mux, ROTATION type) ---
     lp_rot_socket = _build_cascading_mux(
-        nodes, links, lp_rotation_sockets, 'VECTOR',
+        nodes, links, lp_rotation_sockets, 'ROTATION',
         "LPRot", x, y_offset=-800,
     )
 
@@ -296,11 +298,12 @@ def _build_velocity_integration(nodes, links, velocity_socket, position_socket,
                                 target_pos_socket, attraction_socket,
                                 repulsor_force_socket, active_socket,
                                 arrived_socket, max_speed_socket,
-                                delta_time_socket, coast_gate_socket,
-                                x_offset):
+                                max_accel_socket, delta_time_socket,
+                                coast_gate_socket, x_offset):
     """Build attraction force, velocity update, speed clamping, position update.
 
     coast_gate_socket: 0 during coast phase, 1 after. Gates attraction + repulsors.
+    max_accel_socket: caps force magnitude per frame for smooth speed transitions.
     Returns (clamped_velocity_socket, new_position_socket, dist_to_target_socket).
     """
     x = x_offset
@@ -382,13 +385,47 @@ def _build_velocity_integration(nodes, links, velocity_socket, position_socket,
     _link(links, gated_attr.outputs['Vector'], total_force.inputs[0])
     _link(links, gated_rep.outputs['Vector'], total_force.inputs[1])
 
+    # --- Clamp force magnitude to max acceleration ---
+    force_len = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ForceLen", (x + 900, -600),
+    )
+    force_len.operation = 'LENGTH'
+    _link(links, total_force.outputs['Vector'], force_len.inputs[0])
+
+    clamped_force_len = _add_math_node(
+        nodes, 'MINIMUM', "ClampedForceLen", (x + 900, -700),
+    )
+    _link(links, force_len.outputs['Value'], clamped_force_len.inputs[0])
+    _link(links, max_accel_socket, clamped_force_len.inputs[1])
+
+    accel_scale = _add_math_node(
+        nodes, 'DIVIDE', "AccelScale", (x + 900, -800),
+    )
+    _link(links, clamped_force_len.outputs[0], accel_scale.inputs[0])
+    _link(links, force_len.outputs['Value'], accel_scale.inputs[1])
+
+    accel_cap = _add_math_node(
+        nodes, 'MINIMUM', "AccelCap", (x + 1000, -800),
+    )
+    accel_cap.inputs[1].default_value = 1.0
+    _link(links, accel_scale.outputs[0], accel_cap.inputs[0])
+
+    clamped_force = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ClampedForce", (x + 1000, -500),
+    )
+    clamped_force.operation = 'SCALE'
+    _link(links, total_force.outputs['Vector'], clamped_force.inputs[0])
+    _link(links, accel_cap.outputs[0], clamped_force.inputs[3])
+
     # --- Force * dt ---
     force_dt = _add_node(
         nodes, 'ShaderNodeVectorMath',
-        "ForceDt", (x + 1000, -500),
+        "ForceDt", (x + 1200, -500),
     )
     force_dt.operation = 'SCALE'
-    _link(links, total_force.outputs['Vector'], force_dt.inputs[0])
+    _link(links, clamped_force.outputs['Vector'], force_dt.inputs[0])
     _link(links, delta_time_socket, force_dt.inputs[3])
 
     # --- New velocity = old + force*dt ---
@@ -847,6 +884,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         ("Arrival Distance",   'NodeSocketFloat', 20.0),
         ("Torpedo Radius",     'NodeSocketFloat', 10.0),
         ("Coast Frames",       'NodeSocketFloat', 5.0),
+        ("Max Acceleration",   'NodeSocketFloat', 50.0),
     ]
     for name, sock_type, default in param_defs:
         sock = ng.interface.new_socket(name, in_out='INPUT', socket_type=sock_type)
@@ -872,7 +910,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     param_state_names = [
         "ExitVelParam", "AttrParam", "MaxSpeedParam",
         "RepStrParam", "RepRadParam", "ArrDistParam",
-        "CoastParam",
+        "CoastParam", "MaxAccelParam",
     ]
     for name in param_state_names:
         sim_out.state_items.new('FLOAT', name)
@@ -888,6 +926,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         ("Repulsor Radius",   "RepRadParam"),
         ("Arrival Distance",  "ArrDistParam"),
         ("Coast Frames",      "CoastParam"),
+        ("Max Acceleration",  "MaxAccelParam"),
     ]
     for gi_name, state_name in gi_to_state:
         _link(links, group_in.outputs[gi_name], sim_in.inputs[state_name])
@@ -992,6 +1031,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         active_socket=active_socket,
         arrived_socket=sim_in.outputs['Arrived'],
         max_speed_socket=sim_in.outputs['MaxSpeedParam'],
+        max_accel_socket=sim_in.outputs['MaxAccelParam'],
         delta_time_socket=sim_in.outputs['Delta Time'],
         coast_gate_socket=coast_check.outputs[0],
         x_offset=2000,
