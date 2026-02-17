@@ -325,18 +325,18 @@ From AGENTS.md and learnings (all apply to this rebuild):
 
 ## Acceptance Criteria
 
-- [ ] Script reads Launchpads, Targets, Repulsors collections and generates node tree automatically
-- [ ] Adding a launchpad + target to collections + re-running script adds a torpedo
-- [ ] Removing objects from collections + re-running script removes torpedoes
-- [ ] Torpedoes launch when launchpad scale becomes 1 (keyframed)
-- [ ] Torpedoes launch in the direction the arrow empty points
-- [ ] Each torpedo tracks its paired target with attraction force (with distance boost)
-- [ ] Repulsor objects deflect approaching torpedoes (linear falloff, pass-gate)
-- [ ] Torpedoes snap to target and disappear on arrival (velocity zeroed)
-- [ ] Physics parameters tunable in modifier UI (exit velocity, attraction, max speed, repulsor strength/radius, arrival distance, torpedo radius)
-- [ ] Re-running script on existing scene preserves collections, rebuilds node tree
-- [ ] No hardcoded torpedo count anywhere in the script
-- [ ] Validation function raises RuntimeError for missing/empty collections
+- [x] Script reads Launchpads, Targets, Repulsors collections and generates node tree automatically
+- [x] Adding a launchpad + target to collections + re-running script adds a torpedo
+- [x] Removing objects from collections + re-running script removes torpedoes
+- [x] Torpedoes launch when launchpad scale becomes 1 (keyframed)
+- [x] Torpedoes launch in the direction the arrow empty points
+- [x] Each torpedo tracks its paired target with attraction force (with distance boost)
+- [x] Repulsor objects deflect approaching torpedoes (linear falloff, pass-gate)
+- [x] Torpedoes snap to target and disappear on arrival (velocity zeroed)
+- [x] Physics parameters tunable in modifier UI (exit velocity, attraction, max speed, repulsor strength/radius, arrival distance, torpedo radius)
+- [x] Re-running script on existing scene preserves collections, rebuilds node tree
+- [x] No hardcoded torpedo count anywhere in the script
+- [x] Validation function raises RuntimeError for missing/empty collections
 
 **Out of scope:** If objects are deleted from collections after the node tree is built, behavior is undefined. Re-run the script to rebuild.
 
@@ -349,29 +349,29 @@ From AGENTS.md and learnings (all apply to this rebuild):
 - [x] Implement `_create_object_info_nodes()`, `_build_cascading_mux()`, `_build_latch()`
 - [x] Create `build_torpedo_effect()` skeleton: node group, Group Interface, Simulation Zone with state items, pass-through params
 - [x] `setup_test_scene()`: create collections, 4 arrow empties, 4 target empties, 1-2 repulsors, keyframe launchpad scales
-- [ ] Verify: modifier shows in Blender UI with tunable params
+- [x] Verify: modifier shows in Blender UI with tunable params
 
 ### Phase 2: Launch + Attraction + Arrival
 
 - [x] `_build_launch`: Object Info per launchpad → cascading mux → activation latch → launch mask → impulse
 - [x] `_build_velocity_integration`: cascading mux for target pos → attraction (with boost) → force sum → clamping → position update
 - [x] `_build_arrival_detection`: distance check → MAXIMUM latch → position snap → velocity zero
-- [ ] Verify: torpedoes launch at correct frame/direction, curve toward targets, stop cleanly
+- [x] Verify: torpedoes launch at correct frame/direction, curve toward targets, stop cleanly
 
 ### Phase 3: Repulsors + Visuals
 
 - [x] `_build_repulsor_forces`: Object Info per repulsor → linear falloff + pass-gate → sum forces
 - [x] Wire repulsor forces into velocity integration
 - [x] `_build_visual_output`: Set Position → Delete Geometry → Set Material on UV Sphere → Instance on Points (NO Realize)
-- [ ] Verify: torpedoes deflect around repulsors, only active in-flight torpedoes visible
+- [x] Verify: torpedoes deflect around repulsors, only active in-flight torpedoes visible
 
 ### Phase 4: Integration Test
 
-- [ ] Test with 4 launchpads, 4 targets, 1-2 repulsors
-- [ ] Verify staggered launches (different activation frames)
+- [x] Test with 4 launchpads, 4 targets, 1-2 repulsors
+- [x] Verify staggered launches (different activation frames)
 - [ ] Verify moving targets (keyframe target positions)
-- [ ] Test re-run after adding/removing objects from collections
-- [ ] Test timeline scrub (rewind to frame 1, replay)
+- [x] Test re-run after adding/removing objects from collections
+- [x] Test timeline scrub (rewind to frame 1, replay)
 - [ ] Tune physics params for visual quality
 
 ## Edge Cases
