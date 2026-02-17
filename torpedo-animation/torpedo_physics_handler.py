@@ -296,10 +296,12 @@ def _build_velocity_integration(nodes, links, velocity_socket, position_socket,
                                 target_pos_socket, attraction_socket,
                                 repulsor_force_socket, active_socket,
                                 arrived_socket, max_speed_socket,
-                                delta_time_socket, x_offset):
+                                delta_time_socket, coast_gate_socket,
+                                x_offset):
     """Build attraction force, velocity update, speed clamping, position update.
 
-    Returns (clamped_velocity_socket, new_position_socket).
+    coast_gate_socket: 0 during coast phase, 1 after. Gates attraction + repulsors.
+    Returns (clamped_velocity_socket, new_position_socket, dist_to_target_socket).
     """
     x = x_offset
 
@@ -354,14 +356,31 @@ def _build_velocity_integration(nodes, links, velocity_socket, position_socket,
     _link(links, norm_to_target.outputs['Vector'], attr_force.inputs[0])
     _link(links, effective_attr.outputs[0], attr_force.inputs[3])
 
-    # --- Total force = attraction + repulsor ---
+    # --- Gate attraction + repulsors by coast phase ---
+    gated_attr = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "GatedAttraction", (x + 700, -500),
+    )
+    gated_attr.operation = 'SCALE'
+    _link(links, attr_force.outputs['Vector'], gated_attr.inputs[0])
+    _link(links, coast_gate_socket, gated_attr.inputs[3])
+
+    gated_rep = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "GatedRepulsor", (x + 700, -400),
+    )
+    gated_rep.operation = 'SCALE'
+    _link(links, repulsor_force_socket, gated_rep.inputs[0])
+    _link(links, coast_gate_socket, gated_rep.inputs[3])
+
+    # --- Total force = attraction + repulsor (both gated by coast) ---
     total_force = _add_node(
         nodes, 'ShaderNodeVectorMath',
         "TotalForce", (x + 800, -500),
     )
     total_force.operation = 'ADD'
-    _link(links, attr_force.outputs['Vector'], total_force.inputs[0])
-    _link(links, repulsor_force_socket, total_force.inputs[1])
+    _link(links, gated_attr.outputs['Vector'], total_force.inputs[0])
+    _link(links, gated_rep.outputs['Vector'], total_force.inputs[1])
 
     # --- Force * dt ---
     force_dt = _add_node(
@@ -827,6 +846,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         ("Repulsor Radius",    'NodeSocketFloat', 150.0),
         ("Arrival Distance",   'NodeSocketFloat', 20.0),
         ("Torpedo Radius",     'NodeSocketFloat', 10.0),
+        ("Coast Frames",       'NodeSocketFloat', 5.0),
     ]
     for name, sock_type, default in param_defs:
         sock = ng.interface.new_socket(name, in_out='INPUT', socket_type=sock_type)
@@ -846,11 +866,13 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     sim_out.state_items.new('VECTOR', "Velocity")
     sim_out.state_items.new('FLOAT', "Active")
     sim_out.state_items.new('FLOAT', "Arrived")
+    sim_out.state_items.new('FLOAT', "Age")
 
     # Pass-through state items for parameters
     param_state_names = [
         "ExitVelParam", "AttrParam", "MaxSpeedParam",
         "RepStrParam", "RepRadParam", "ArrDistParam",
+        "CoastParam",
     ]
     for name in param_state_names:
         sim_out.state_items.new('FLOAT', name)
@@ -865,6 +887,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         ("Repulsor Strength", "RepStrParam"),
         ("Repulsor Radius",   "RepRadParam"),
         ("Arrival Distance",  "ArrDistParam"),
+        ("Coast Frames",      "CoastParam"),
     ]
     for gi_name, state_name in gi_to_state:
         _link(links, group_in.outputs[gi_name], sim_in.inputs[state_name])
@@ -913,6 +936,20 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         )
     )
 
+    # --- Age counter: frames since activation ---
+    new_age = _add_math_node(
+        nodes, 'ADD', "AgeIncrement", (1800, -200),
+    )
+    _link(links, sim_in.outputs['Age'], new_age.inputs[0])
+    _link(links, active_socket, new_age.inputs[1])
+
+    # Coast gate: tracking starts after coast frames elapsed
+    coast_check = _add_math_node(
+        nodes, 'GREATER_THAN', "CoastCheck", (2000, -200),
+    )
+    _link(links, new_age.outputs[0], coast_check.inputs[0])
+    _link(links, sim_in.outputs['CoastParam'], coast_check.inputs[1])
+
     # --- Sub-builder: Repulsors ---
     # Need dist_to_target for pass-gate, but velocity_integration computes it.
     # Build repulsors with a temporary dist_to_target computation.
@@ -956,6 +993,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
         arrived_socket=sim_in.outputs['Arrived'],
         max_speed_socket=sim_in.outputs['MaxSpeedParam'],
         delta_time_socket=sim_in.outputs['Delta Time'],
+        coast_gate_socket=coast_check.outputs[0],
         x_offset=2000,
     )
 
@@ -976,6 +1014,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     _link(links, final_vel_socket, sim_out.inputs['Velocity'])
     _link(links, active_socket, sim_out.inputs['Active'])
     _link(links, arrived_socket, sim_out.inputs['Arrived'])
+    _link(links, new_age.outputs[0], sim_out.inputs['Age'])
 
     # --- Post-sim visual output ---
     mat = _create_torpedo_material()
