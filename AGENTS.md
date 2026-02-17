@@ -51,6 +51,8 @@ These are hard-won lessons — do not retry these failed approaches:
 - **Node link removal invalidates Python references.** Always iterate over `list(ng.links)` copies and re-fetch node references after removal.
 - **`display_type = 'PLAIN_AXES'` is invalid for mesh objects.** Use `'WIRE'` instead.
 - **Vector Math SCALE float input is at socket index 3**, not index 1.
+- **ShaderNodeMix socket indices vary by `data_type`**: FLOAT=(A:2, B:3, Result:0), VECTOR=(A:4, B:5, Result:1), RGBA=(A:6, B:7, Result:2), ROTATION=(A:8, B:9, Result:3). Object Info Rotation is type ROTATION, not VECTOR.
+- **`to_mesh()` cannot realize instances.** InstanceOnPoints output always returns 0 verts from `to_mesh()`. Bypass Instance/Delete nodes for debugging.
 - **Simulation Zone state items use `'VECTOR'`**, not `'FLOAT_VECTOR'`, in `state_items.new()`.
 - **GeoNodes visibility control**: Use Delete Geometry nodes to output empty geometry instead of `hide_viewport`/`hide_render` flags. For always-hidden objects, apply a GeoNodes modifier that deletes all points.
 

@@ -369,10 +369,10 @@ From AGENTS.md and learnings (all apply to this rebuild):
 
 - [x] Test with 4 launchpads, 4 targets, 1-2 repulsors
 - [x] Verify staggered launches (different activation frames)
-- [ ] Verify moving targets (keyframe target positions)
+- [x] Verify moving targets (keyframe target positions)
 - [x] Test re-run after adding/removing objects from collections
 - [x] Test timeline scrub (rewind to frame 1, replay)
-- [ ] Tune physics params for visual quality
+- [x] Tune physics params for visual quality
 
 ## Edge Cases
 

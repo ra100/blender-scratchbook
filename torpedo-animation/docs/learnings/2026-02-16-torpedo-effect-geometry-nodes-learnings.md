@@ -201,6 +201,61 @@ TorpedoController (2-vertex mesh, one per torpedo)
         └── Set Material (TorpedoEmission)
 ```
 
+## Collection-Driven Rebuild Learnings (2026-02-17)
+
+### ShaderNodeMix Socket Indices by data_type
+
+The Mix node (`ShaderNodeMix`) uses different socket indices depending on `data_type`:
+
+| data_type | A input | B input | Result output |
+|-----------|---------|---------|---------------|
+| FLOAT     | 2       | 3       | 0             |
+| VECTOR    | 4       | 5       | 1             |
+| RGBA      | 6       | 7       | 2             |
+| ROTATION  | 8       | 9       | 3             |
+
+**Critical:** Object Info `Rotation` output is type `ROTATION`, not `VECTOR`. Using VECTOR socket indices (4/5) for rotation data silently produces wrong values without errors.
+
+### Cascading Mux Pattern for N Torpedoes
+
+Replaced binary Index+Compare+Mix with a cascading chain:
+
+```
+Index == 1? Mix(A=socket_0, B=socket_1) → result_1
+Index == 2? Mix(A=result_1,  B=socket_2) → result_2
+Index == 3? Mix(A=result_2,  B=socket_3) → result_3
+...
+```
+
+Works for FLOAT, VECTOR, and ROTATION data types. The first socket is the default (used when Index == 0).
+
+### to_mesh() Cannot Realize Instances
+
+`object.to_mesh()` on evaluated geometry returns 0 vertices when the GeoNodes output uses Instance on Points. This is a fundamental Blender limitation — `to_mesh()` does not realize instances. For debugging, bypass InstanceOnPoints and DeleteGeometry nodes to get raw simulation points.
+
+### Coast Phase + Max Acceleration for Smooth Launches
+
+Two parameters produce visually pleasing torpedo launches:
+
+1. **Coast Frames** (default 5): torpedoes travel along initial heading for N frames before target tracking activates. Implemented as an `Age` counter (incremented by Active each frame) gated with `Age > CoastFrames`.
+
+2. **Max Acceleration** (default 50): caps total force magnitude per frame. Prevents instant velocity jumps from coast speed to max speed. Uses same clamp pattern as speed clamping:
+   ```
+   force_len = Length(total_force)
+   clamped_len = Min(force_len, max_accel)
+   scale = clamped_len / force_len   # safe: 0/0=0 in Blender
+   cap = Min(scale, 1.0)
+   clamped_force = Scale(total_force, cap)
+   ```
+
+### SINGLE_ARROW Empties Point Along +Z
+
+Arrow empties (`empty_display_type = 'SINGLE_ARROW'`) point along the **+Z axis** by default. To point toward +X, use `rotation_euler = (0, radians(90), 0)`. The `FunctionNodeRotateVector` correctly rotates a base vector `(0, 0, 1)` by the Object Info Rotation output.
+
+### Debug Node Insertion Can Break Geometry Chain
+
+When inserting/removing debug nodes (Store Named Attribute) in the geometry chain, link references invalidate on removal. Always verify the full geometry chain after cleanup: `SimOutput[Geo] → SetPosition → DeleteGeometry → InstanceOnPoints → GroupOutput`.
+
 ## Deviations from Plan
 
 | Plan | Actual | Reason |
