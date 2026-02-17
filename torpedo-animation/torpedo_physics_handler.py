@@ -1,8 +1,9 @@
 """
-Torpedo Effect — Scene Setup Script
-=====================================
+Torpedo Effect — Collection-Driven Scene Setup Script
+======================================================
 Creates the scene objects and GeoNodes node tree for the torpedo animation.
-Run once to set up, then the animation is fully driven by GeoNodes.
+Reads Launchpads, Targets, and Repulsors collections to generate a dynamic
+node tree supporting N torpedoes. Re-run after adding/removing objects.
 
 No Python handlers are used during simulation — everything runs inside
 Geometry Nodes with a Simulation Zone.
@@ -13,38 +14,759 @@ Usage:
 
 import bpy
 import bmesh
+from math import radians
 from mathutils import Vector
 
 
 # ============================================================
-# Configuration
+# Constants
 # ============================================================
 
-TORPEDO_CONFIG = {
-    "Torpedo1": {"target": "Target1", "launch_frame": 10},
-    "Torpedo2": {"target": "Target2", "launch_frame": 15},
-}
+NODE_GROUP_NAME = "TorpedoEffect"
+LAUNCHPAD_COLLECTION = "Launchpads"
+TARGET_COLLECTION = "Targets"
+REPULSOR_COLLECTION = "Repulsors"
+CONTROLLER_NAME = "TorpedoController"
+MATERIAL_NAME = "TorpedoEmission"
 
-PHYSICS = {
-    "attraction": 400.0,
-    "max_speed": 200.0,
-    "initial_speed": 50.0,
-    "repulsor_strength": 300.0,       # effective strength at current scale
-    "repulsor_strength_base": 30.1,   # multiplied by object scale.x
-    "repulsor_radius": 250.0,
-    "arrival_distance": 20.0,
-    "torpedo_radius": 10.0,
-}
+ACTIVATION_THRESHOLD = 0.5
+ATTRACTION_REF_DISTANCE = 1000.0
 
 
 # ============================================================
-# Material
+# Helpers (same pattern as shield_ripple_effect.py)
 # ============================================================
 
-def create_emission_material():
-    mat = bpy.data.materials.get("TorpedoEmission")
+def _add_node(nodes, type_str, label, location):
+    """Create a node, set its label and location."""
+    node = nodes.new(type_str)
+    node.label = label
+    node.name = label
+    node.location = location
+    return node
+
+
+def _add_math_node(nodes, operation, label, location):
+    """Create a ShaderNodeMath with a preset operation."""
+    node = nodes.new("ShaderNodeMath")
+    node.operation = operation
+    node.label = label
+    node.name = label
+    node.location = location
+    return node
+
+
+def _link(links, from_socket, to_socket):
+    """Create a node link."""
+    links.new(from_socket, to_socket)
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+def _validate_collections():
+    """Read and validate Launchpads, Targets, Repulsors collections.
+
+    Returns sorted (launchpads, targets, repulsors) lists.
+    Raises RuntimeError if collections are missing or empty.
+    """
+    for name in (LAUNCHPAD_COLLECTION, TARGET_COLLECTION):
+        col = bpy.data.collections.get(name)
+        if col is None:
+            raise RuntimeError(
+                f"Collection '{name}' not found. Create it and add objects."
+            )
+        if len(col.objects) == 0:
+            raise RuntimeError(
+                f"Collection '{name}' is empty. Add at least one object."
+            )
+
+    launchpads = sorted(
+        bpy.data.collections[LAUNCHPAD_COLLECTION].objects,
+        key=lambda o: o.name,
+    )
+    targets = sorted(
+        bpy.data.collections[TARGET_COLLECTION].objects,
+        key=lambda o: o.name,
+    )
+
+    n = min(len(launchpads), len(targets))
+    if len(launchpads) != len(targets):
+        print(f"WARNING: {len(launchpads)} launchpads, {len(targets)} targets. "
+              f"Using {n} torpedoes (min of both).")
+    launchpads = launchpads[:n]
+    targets = targets[:n]
+
+    rep_col = bpy.data.collections.get(REPULSOR_COLLECTION)
+    repulsors = []
+    if rep_col and len(rep_col.objects) > 0:
+        repulsors = sorted(rep_col.objects, key=lambda o: o.name)
+
+    return launchpads, targets, repulsors
+
+
+# ============================================================
+# Node Helpers
+# ============================================================
+
+def _create_object_info_nodes(nodes, objects, label_prefix, x, y_start, y_step):
+    """Create Object Info nodes for a list of scene objects.
+
+    Returns list of Object Info nodes with direct refs and ORIGINAL space.
+    """
+    info_nodes = []
+    for i, obj in enumerate(objects):
+        info = _add_node(
+            nodes, 'GeometryNodeObjectInfo',
+            f"{label_prefix}_{obj.name}", (x, y_start - i * y_step),
+        )
+        info.inputs['Object'].default_value = obj
+        info.transform_space = 'ORIGINAL'
+        info_nodes.append(info)
+    return info_nodes
+
+
+def _build_cascading_mux(nodes, links, per_torpedo_sockets, data_type,
+                         label_prefix, x_offset, y_offset=0):
+    """Build a cascading Index+Compare+Mix chain for per-torpedo selection.
+
+    per_torpedo_sockets: list of sockets, one per torpedo (e.g. target positions)
+    data_type: 'VECTOR' or 'FLOAT'
+    Returns the result socket that holds the correct value per point.
+    """
+    if len(per_torpedo_sockets) == 1:
+        return per_torpedo_sockets[0]
+
+    index_node = _add_node(
+        nodes, 'GeometryNodeInputIndex',
+        f"{label_prefix}_Index", (x_offset, y_offset),
+    )
+
+    result_socket = per_torpedo_sockets[0]
+    for i in range(1, len(per_torpedo_sockets)):
+        compare = _add_node(
+            nodes, 'FunctionNodeCompare',
+            f"{label_prefix}_Is{i}", (x_offset + 200, y_offset - i * 150),
+        )
+        compare.data_type = 'INT'
+        compare.operation = 'EQUAL'
+        compare.inputs[3].default_value = i  # B = i (INT B is socket index 3)
+        _link(links, index_node.outputs['Index'], compare.inputs[2])  # A = Index (INT A is socket index 2)
+
+        mix = _add_node(
+            nodes, 'ShaderNodeMix',
+            f"{label_prefix}_Mix{i}", (x_offset + 400, y_offset - i * 150),
+        )
+        mix.data_type = data_type
+        mix.clamp_factor = True
+        _link(links, compare.outputs['Result'], mix.inputs['Factor'])
+
+        if data_type == 'VECTOR':
+            _link(links, result_socket, mix.inputs[4])  # A
+            _link(links, per_torpedo_sockets[i], mix.inputs[5])  # B
+            result_socket = mix.outputs[1]  # Vector Result
+        else:
+            _link(links, result_socket, mix.inputs[2])  # A
+            _link(links, per_torpedo_sockets[i], mix.inputs[3])  # B
+            result_socket = mix.outputs[0]  # Float Result
+
+    return result_socket
+
+
+def _build_latch(nodes, links, check_socket, prev_socket, label, location):
+    """Build a MAXIMUM latch: once value reaches 1, stays 1 forever."""
+    latch = _add_math_node(nodes, 'MAXIMUM', label, location)
+    _link(links, prev_socket, latch.inputs[0])
+    _link(links, check_socket, latch.inputs[1])
+    return latch.outputs[0]
+
+
+# ============================================================
+# Sub-builders
+# ============================================================
+
+def _build_launch(nodes, links, lp_scale_sockets, lp_rotation_sockets,
+                  exit_vel_socket, prev_active_socket, prev_velocity_socket,
+                  x_offset):
+    """Build activation detection and launch impulse.
+
+    Returns (active_socket, launch_mask_socket, initial_velocity_socket).
+    """
+    x = x_offset
+
+    # --- Per-torpedo launchpad scale (via cascading mux, VECTOR type) ---
+    lp_scale_socket = _build_cascading_mux(
+        nodes, links, lp_scale_sockets, 'VECTOR',
+        "LPScale", x, y_offset=-200,
+    )
+
+    # --- Per-torpedo launchpad rotation (via cascading mux) ---
+    lp_rot_socket = _build_cascading_mux(
+        nodes, links, lp_rotation_sockets, 'VECTOR',
+        "LPRot", x, y_offset=-800,
+    )
+
+    # --- Activation: scale vector length > threshold ---
+    scale_len = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ScaleLength", (x + 600, -200),
+    )
+    scale_len.operation = 'LENGTH'
+    _link(links, lp_scale_socket, scale_len.inputs[0])
+
+    activation_check = _add_math_node(
+        nodes, 'GREATER_THAN', "ActivationCheck", (x + 800, -200),
+    )
+    activation_check.inputs[1].default_value = ACTIVATION_THRESHOLD
+    _link(links, scale_len.outputs['Value'], activation_check.inputs[0])
+
+    # --- Active latch (MAXIMUM) ---
+    active_socket = _build_latch(
+        nodes, links,
+        activation_check.outputs[0], prev_active_socket,
+        "ActiveLatch", (x + 1000, -200),
+    )
+
+    # --- Launch mask: Active_current - Active_previous = 1 on first frame ---
+    launch_mask = _add_math_node(
+        nodes, 'SUBTRACT', "LaunchMask", (x + 1200, -200),
+    )
+    _link(links, active_socket, launch_mask.inputs[0])
+    _link(links, prev_active_socket, launch_mask.inputs[1])
+
+    # --- Direction from rotation: Rotate (0,1,0) by launchpad rotation ---
+    rotate_vec = _add_node(
+        nodes, 'FunctionNodeRotateVector',
+        "RotateForward", (x + 600, -600),
+    )
+    rotate_vec.inputs['Vector'].default_value = (0.0, 1.0, 0.0)  # +Y forward
+    _link(links, lp_rot_socket, rotate_vec.inputs['Rotation'])
+
+    # --- Launch impulse: forward * exit_velocity * launch_mask ---
+    impulse_scale = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ImpulseScale", (x + 800, -600),
+    )
+    impulse_scale.operation = 'SCALE'
+    _link(links, rotate_vec.outputs['Vector'], impulse_scale.inputs[0])
+    _link(links, exit_vel_socket, impulse_scale.inputs[3])
+
+    impulse_masked = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ImpulseMasked", (x + 1000, -600),
+    )
+    impulse_masked.operation = 'SCALE'
+    _link(links, impulse_scale.outputs['Vector'], impulse_masked.inputs[0])
+    _link(links, launch_mask.outputs[0], impulse_masked.inputs[3])
+
+    # --- Add impulse to previous velocity ---
+    initial_velocity = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "InitialVelocity", (x + 1200, -600),
+    )
+    initial_velocity.operation = 'ADD'
+    _link(links, prev_velocity_socket, initial_velocity.inputs[0])
+    _link(links, impulse_masked.outputs['Vector'], initial_velocity.inputs[1])
+
+    return active_socket, launch_mask.outputs[0], initial_velocity.outputs['Vector']
+
+
+def _build_velocity_integration(nodes, links, velocity_socket, position_socket,
+                                target_pos_socket, attraction_socket,
+                                repulsor_force_socket, active_socket,
+                                arrived_socket, max_speed_socket,
+                                delta_time_socket, x_offset):
+    """Build attraction force, velocity update, speed clamping, position update.
+
+    Returns (clamped_velocity_socket, new_position_socket).
+    """
+    x = x_offset
+
+    # --- Direction to target ---
+    to_target = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ToTarget", (x, -500),
+    )
+    to_target.operation = 'SUBTRACT'
+    _link(links, target_pos_socket, to_target.inputs[0])
+    _link(links, position_socket, to_target.inputs[1])
+
+    dist_to_target = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "DistToTarget", (x + 200, -500),
+    )
+    dist_to_target.operation = 'LENGTH'
+    _link(links, to_target.outputs['Vector'], dist_to_target.inputs[0])
+
+    norm_to_target = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "NormToTarget", (x + 200, -600),
+    )
+    norm_to_target.operation = 'NORMALIZE'
+    _link(links, to_target.outputs['Vector'], norm_to_target.inputs[0])
+
+    # --- Attraction boost: attraction * (1 + RefDist / dist_to_target) ---
+    ref_over_dist = _add_math_node(
+        nodes, 'DIVIDE', "RefOverDist", (x + 400, -700),
+    )
+    ref_over_dist.inputs[0].default_value = ATTRACTION_REF_DISTANCE
+    _link(links, dist_to_target.outputs['Value'], ref_over_dist.inputs[1])
+
+    one_plus_boost = _add_math_node(
+        nodes, 'ADD', "OnePlusBoost", (x + 400, -600),
+    )
+    one_plus_boost.inputs[0].default_value = 1.0
+    _link(links, ref_over_dist.outputs[0], one_plus_boost.inputs[1])
+
+    effective_attr = _add_math_node(
+        nodes, 'MULTIPLY', "EffectiveAttraction", (x + 600, -600),
+    )
+    _link(links, attraction_socket, effective_attr.inputs[0])
+    _link(links, one_plus_boost.outputs[0], effective_attr.inputs[1])
+
+    # --- Attraction force vector ---
+    attr_force = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "AttractionForce", (x + 600, -500),
+    )
+    attr_force.operation = 'SCALE'
+    _link(links, norm_to_target.outputs['Vector'], attr_force.inputs[0])
+    _link(links, effective_attr.outputs[0], attr_force.inputs[3])
+
+    # --- Total force = attraction + repulsor ---
+    total_force = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "TotalForce", (x + 800, -500),
+    )
+    total_force.operation = 'ADD'
+    _link(links, attr_force.outputs['Vector'], total_force.inputs[0])
+    _link(links, repulsor_force_socket, total_force.inputs[1])
+
+    # --- Force * dt ---
+    force_dt = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ForceDt", (x + 1000, -500),
+    )
+    force_dt.operation = 'SCALE'
+    _link(links, total_force.outputs['Vector'], force_dt.inputs[0])
+    _link(links, delta_time_socket, force_dt.inputs[3])
+
+    # --- New velocity = old + force*dt ---
+    new_vel = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "NewVel", (x + 1200, -500),
+    )
+    new_vel.operation = 'ADD'
+    _link(links, velocity_socket, new_vel.inputs[0])
+    _link(links, force_dt.outputs['Vector'], new_vel.inputs[1])
+
+    # --- Speed clamping ---
+    vel_len = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "VelLength", (x + 1200, -600),
+    )
+    vel_len.operation = 'LENGTH'
+    _link(links, new_vel.outputs['Vector'], vel_len.inputs[0])
+
+    clamped_len = _add_math_node(
+        nodes, 'MINIMUM', "ClampedLen", (x + 1400, -600),
+    )
+    _link(links, vel_len.outputs['Value'], clamped_len.inputs[0])
+    _link(links, max_speed_socket, clamped_len.inputs[1])
+
+    scale_factor = _add_math_node(
+        nodes, 'DIVIDE', "ScaleFactor", (x + 1400, -700),
+    )
+    _link(links, clamped_len.outputs[0], scale_factor.inputs[0])
+    _link(links, vel_len.outputs['Value'], scale_factor.inputs[1])
+
+    # Cap at 1.0 (DIVIDE returns 0 for 0/0 which is safe)
+    cap = _add_math_node(nodes, 'MINIMUM', "Cap", (x + 1600, -700))
+    cap.inputs[1].default_value = 1.0
+    _link(links, scale_factor.outputs[0], cap.inputs[0])
+
+    clamped_vel = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "ClampedVel", (x + 1600, -500),
+    )
+    clamped_vel.operation = 'SCALE'
+    _link(links, new_vel.outputs['Vector'], clamped_vel.inputs[0])
+    _link(links, cap.outputs[0], clamped_vel.inputs[3])
+
+    # --- Active/Arrived masking on velocity ---
+    one_minus_arrived = _add_math_node(
+        nodes, 'SUBTRACT', "OneMinusArrived", (x + 1800, -600),
+    )
+    one_minus_arrived.inputs[0].default_value = 1.0
+    _link(links, arrived_socket, one_minus_arrived.inputs[1])
+
+    active_mask = _add_math_node(
+        nodes, 'MULTIPLY', "ActiveMask", (x + 1800, -500),
+    )
+    _link(links, active_socket, active_mask.inputs[0])
+    _link(links, one_minus_arrived.outputs[0], active_mask.inputs[1])
+
+    masked_vel = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "MaskedVel", (x + 2000, -500),
+    )
+    masked_vel.operation = 'SCALE'
+    _link(links, clamped_vel.outputs['Vector'], masked_vel.inputs[0])
+    _link(links, active_mask.outputs[0], masked_vel.inputs[3])
+
+    # --- Position update: pos + vel * dt ---
+    vel_dt = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "VelDt", (x + 2200, -500),
+    )
+    vel_dt.operation = 'SCALE'
+    _link(links, masked_vel.outputs['Vector'], vel_dt.inputs[0])
+    _link(links, delta_time_socket, vel_dt.inputs[3])
+
+    new_pos = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "NewPos", (x + 2400, -500),
+    )
+    new_pos.operation = 'ADD'
+    _link(links, position_socket, new_pos.inputs[0])
+    _link(links, vel_dt.outputs['Vector'], new_pos.inputs[1])
+
+    # --- Gate position: only move if active ---
+    start_pos = _add_node(
+        nodes, 'GeometryNodeInputPosition',
+        "StartPosition", (x + 2400, -700),
+    )
+
+    pos_select = _add_node(
+        nodes, 'ShaderNodeMix',
+        "PosSelect", (x + 2600, -500),
+    )
+    pos_select.data_type = 'VECTOR'
+    pos_select.clamp_factor = True
+    _link(links, active_socket, pos_select.inputs['Factor'])
+    _link(links, start_pos.outputs['Position'], pos_select.inputs[4])  # A (inactive)
+    _link(links, new_pos.outputs['Vector'], pos_select.inputs[5])  # B (active)
+
+    return (
+        masked_vel.outputs['Vector'],
+        pos_select.outputs[1],
+        dist_to_target.outputs['Value'],
+    )
+
+
+def _build_arrival_detection(nodes, links, position_socket, target_pos_socket,
+                             velocity_socket, dist_to_target_socket,
+                             arrival_dist_socket, prev_arrived_socket, x_offset):
+    """Build arrival detection with position snap and velocity zero.
+
+    Returns (arrived_socket, final_position_socket, final_velocity_socket).
+    """
+    x = x_offset
+
+    # --- Arrival check: dist < arrival_distance ---
+    arrival_check = _add_math_node(
+        nodes, 'LESS_THAN', "ArrivalCheck", (x, -400),
+    )
+    _link(links, dist_to_target_socket, arrival_check.inputs[0])
+    _link(links, arrival_dist_socket, arrival_check.inputs[1])
+
+    # --- Arrived latch (MAXIMUM) ---
+    arrived_socket = _build_latch(
+        nodes, links,
+        arrival_check.outputs[0], prev_arrived_socket,
+        "ArrivedLatch", (x + 200, -400),
+    )
+
+    # --- First arrival frame: Arrived_now - Arrived_prev ---
+    first_arrival = _add_math_node(
+        nodes, 'SUBTRACT', "FirstArrival", (x + 400, -400),
+    )
+    _link(links, arrived_socket, first_arrival.inputs[0])
+    _link(links, prev_arrived_socket, first_arrival.inputs[1])
+
+    # --- Position snap: Mix(first_arrival, computed_pos, target_pos) ---
+    pos_snap = _add_node(
+        nodes, 'ShaderNodeMix',
+        "PosSnap", (x + 600, -400),
+    )
+    pos_snap.data_type = 'VECTOR'
+    pos_snap.clamp_factor = True
+    _link(links, first_arrival.outputs[0], pos_snap.inputs['Factor'])
+    _link(links, position_socket, pos_snap.inputs[4])  # A (not arriving)
+    _link(links, target_pos_socket, pos_snap.inputs[5])  # B (snap to target)
+
+    # --- Velocity zero on arrival ---
+    # ShaderNodeMix: factor=0→A, factor=1→B
+    # arrived=0 → A (computed vel), arrived=1 → B (zero)
+    vel_zero = _add_node(
+        nodes, 'ShaderNodeMix',
+        "VelZero", (x + 600, -600),
+    )
+    vel_zero.data_type = 'VECTOR'
+    vel_zero.clamp_factor = True
+    _link(links, arrived_socket, vel_zero.inputs['Factor'])
+    _link(links, velocity_socket, vel_zero.inputs[4])  # A = computed vel
+    vel_zero.inputs[5].default_value = (0.0, 0.0, 0.0)  # B = zero
+
+    return arrived_socket, pos_snap.outputs[1], vel_zero.outputs[1]
+
+
+def _build_repulsor_forces(nodes, links, position_socket, target_pos_socket,
+                           dist_to_target_socket, repulsor_info_nodes,
+                           rep_strength_socket, rep_radius_socket, x_offset):
+    """Build repulsor avoidance forces (per-repulsor linear falloff + pass-gate).
+
+    Returns total_repulsor_force_socket.
+    """
+    if not repulsor_info_nodes:
+        # No repulsors — return a zero vector constant
+        zero_vec = _add_node(
+            nodes, 'FunctionNodeInputVector',
+            "ZeroRepForce", (x_offset, -1000),
+        )
+        zero_vec.vector = (0.0, 0.0, 0.0)
+        return zero_vec.outputs[0]
+
+    x = x_offset
+    force_sockets = []
+
+    for i, rep_info in enumerate(repulsor_info_nodes):
+        y = -1000 - i * 400
+
+        # away = torpedo_pos - repulsor_pos
+        away = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"Away_R{i}", (x, y),
+        )
+        away.operation = 'SUBTRACT'
+        _link(links, position_socket, away.inputs[0])
+        _link(links, rep_info.outputs['Location'], away.inputs[1])
+
+        dist_rep = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"DistRep_{i}", (x + 200, y),
+        )
+        dist_rep.operation = 'LENGTH'
+        _link(links, away.outputs['Vector'], dist_rep.inputs[0])
+
+        # falloff = max(0, 1 - dist/radius)
+        dist_norm = _add_math_node(
+            nodes, 'DIVIDE', f"RepDistNorm_{i}", (x + 200, y - 100),
+        )
+        _link(links, dist_rep.outputs['Value'], dist_norm.inputs[0])
+        _link(links, rep_radius_socket, dist_norm.inputs[1])
+
+        falloff_sub = _add_math_node(
+            nodes, 'SUBTRACT', f"RepFalloffSub_{i}", (x + 400, y - 100),
+        )
+        falloff_sub.inputs[0].default_value = 1.0
+        _link(links, dist_norm.outputs[0], falloff_sub.inputs[1])
+
+        falloff_clamp = _add_math_node(
+            nodes, 'MAXIMUM', f"RepFalloff_{i}", (x + 400, y),
+        )
+        falloff_clamp.inputs[1].default_value = 0.0
+        _link(links, falloff_sub.outputs[0], falloff_clamp.inputs[0])
+
+        norm_away = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"NormAway_{i}", (x + 400, y + 100),
+        )
+        norm_away.operation = 'NORMALIZE'
+        _link(links, away.outputs['Vector'], norm_away.inputs[0])
+
+        # strength * falloff
+        strength_falloff = _add_math_node(
+            nodes, 'MULTIPLY', f"StrFalloff_{i}", (x + 600, y),
+        )
+        _link(links, rep_strength_socket, strength_falloff.inputs[0])
+        _link(links, falloff_clamp.outputs[0], strength_falloff.inputs[1])
+
+        # rep_force = normalize(away) * strength * falloff
+        rep_force = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"RepForce_{i}", (x + 600, y + 100),
+        )
+        rep_force.operation = 'SCALE'
+        _link(links, norm_away.outputs['Vector'], rep_force.inputs[0])
+        _link(links, strength_falloff.outputs[0], rep_force.inputs[3])
+
+        # --- Pass-gate: only repulse if torpedo hasn't passed repulsor ---
+        rep_to_target = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"RepToTarget_{i}", (x + 200, y - 200),
+        )
+        rep_to_target.operation = 'SUBTRACT'
+        _link(links, target_pos_socket, rep_to_target.inputs[0])
+        _link(links, rep_info.outputs['Location'], rep_to_target.inputs[1])
+
+        dist_rep_target = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"DistRepTarget_{i}", (x + 400, y - 200),
+        )
+        dist_rep_target.operation = 'LENGTH'
+        _link(links, rep_to_target.outputs['Vector'], dist_rep_target.inputs[0])
+
+        rep_gate = _add_math_node(
+            nodes, 'GREATER_THAN', f"RepGate_{i}", (x + 600, y - 200),
+        )
+        _link(links, dist_to_target_socket, rep_gate.inputs[0])
+        _link(links, dist_rep_target.outputs['Value'], rep_gate.inputs[1])
+
+        gated_rep = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"GatedRep_{i}", (x + 800, y),
+        )
+        gated_rep.operation = 'SCALE'
+        _link(links, rep_force.outputs['Vector'], gated_rep.inputs[0])
+        _link(links, rep_gate.outputs[0], gated_rep.inputs[3])
+
+        force_sockets.append(gated_rep.outputs['Vector'])
+
+    # Sum all repulsor forces
+    if len(force_sockets) == 1:
+        return force_sockets[0]
+
+    result = force_sockets[0]
+    for i in range(1, len(force_sockets)):
+        add_forces = _add_node(
+            nodes, 'ShaderNodeVectorMath',
+            f"SumRep_{i}", (x + 1000, -1000 - i * 200),
+        )
+        add_forces.operation = 'ADD'
+        _link(links, result, add_forces.inputs[0])
+        _link(links, force_sockets[i], add_forces.inputs[1])
+        result = add_forces.outputs['Vector']
+
+    return result
+
+
+def _build_visual_output(nodes, links, geo_socket, position_socket,
+                         active_socket, arrived_socket, torpedo_radius_socket,
+                         material, x_offset):
+    """Build post-sim visual pipeline: Set Position → Delete → Instance → Material.
+
+    Returns final_geometry_socket.
+    """
+    x = x_offset
+
+    # --- Set Position ---
+    set_pos = _add_node(
+        nodes, 'GeometryNodeSetPosition',
+        "SetPosition", (x, 0),
+    )
+    _link(links, geo_socket, set_pos.inputs['Geometry'])
+    _link(links, position_socket, set_pos.inputs['Position'])
+
+    # --- Visibility: active AND NOT arrived ---
+    one_minus_arrived = _add_math_node(
+        nodes, 'SUBTRACT', "OneMinusArrivedPost", (x, -100),
+    )
+    one_minus_arrived.inputs[0].default_value = 1.0
+    _link(links, arrived_socket, one_minus_arrived.inputs[1])
+
+    vis_mask = _add_math_node(
+        nodes, 'MULTIPLY', "VisMask", (x + 200, -100),
+    )
+    _link(links, active_socket, vis_mask.inputs[0])
+    _link(links, one_minus_arrived.outputs[0], vis_mask.inputs[1])
+
+    # Invert for deletion selection (delete where NOT visible)
+    vis_invert = _add_math_node(
+        nodes, 'SUBTRACT', "VisInvert", (x + 200, 0),
+    )
+    vis_invert.inputs[0].default_value = 1.0
+    _link(links, vis_mask.outputs[0], vis_invert.inputs[1])
+
+    vis_bool = _add_math_node(
+        nodes, 'GREATER_THAN', "VisBool", (x + 400, 0),
+    )
+    vis_bool.inputs[1].default_value = 0.5
+    _link(links, vis_invert.outputs[0], vis_bool.inputs[0])
+
+    delete = _add_node(
+        nodes, 'GeometryNodeDeleteGeometry',
+        "DeleteInvisible", (x + 400, 100),
+    )
+    delete.domain = 'POINT'
+    _link(links, set_pos.outputs['Geometry'], delete.inputs['Geometry'])
+    _link(links, vis_bool.outputs[0], delete.inputs['Selection'])
+
+    # --- UV Sphere with material (set material BEFORE instancing) ---
+    uv_sphere = _add_node(
+        nodes, 'GeometryNodeMeshUVSphere',
+        "TorpedoSphere", (x + 400, 300),
+    )
+    uv_sphere.inputs['Segments'].default_value = 16
+    uv_sphere.inputs['Rings'].default_value = 8
+    _link(links, torpedo_radius_socket, uv_sphere.inputs['Radius'])
+
+    set_mat = _add_node(
+        nodes, 'GeometryNodeSetMaterial',
+        "SetMaterial", (x + 600, 300),
+    )
+    set_mat.inputs['Material'].default_value = material
+    _link(links, uv_sphere.outputs['Mesh'], set_mat.inputs['Geometry'])
+
+    # --- Instance on Points (NO Realize Instances) ---
+    instance_pts = _add_node(
+        nodes, 'GeometryNodeInstanceOnPoints',
+        "InstanceOnPoints", (x + 600, 100),
+    )
+    _link(links, delete.outputs['Geometry'], instance_pts.inputs['Points'])
+    _link(links, set_mat.outputs['Geometry'], instance_pts.inputs['Instance'])
+
+    return instance_pts.outputs['Instances']
+
+
+# ============================================================
+# Scene Functions
+# ============================================================
+
+def _ensure_clean_node_group(name):
+    """Create a fresh node group, removing any existing one with this name."""
+    old = bpy.data.node_groups.get(name)
+    if old:
+        bpy.data.node_groups.remove(old)
+    ng = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    ng.is_modifier = True
+    return ng
+
+
+def _create_controller_mesh(num_vertices):
+    """Create or update the TorpedoController mesh with N vertices.
+
+    Returns the controller object.
+    """
+    obj = bpy.data.objects.get(CONTROLLER_NAME)
+    mesh = bpy.data.meshes.get(CONTROLLER_NAME)
+
+    if mesh is None:
+        mesh = bpy.data.meshes.new(CONTROLLER_NAME)
+
+    # Build N-vertex mesh via bmesh (in-place replace)
+    bm = bmesh.new()
+    for i in range(num_vertices):
+        bm.verts.new((0, 0, 0))
+    bm.to_mesh(mesh)
+    bm.free()
+
+    if obj is None:
+        obj = bpy.data.objects.new(CONTROLLER_NAME, mesh)
+        bpy.context.scene.collection.objects.link(obj)
+    else:
+        obj.data = mesh
+
+    obj.display_type = 'WIRE'
+    return obj
+
+
+def _create_torpedo_material():
+    """Create or update the TorpedoEmission material."""
+    mat = bpy.data.materials.get(MATERIAL_NAME)
     if not mat:
-        mat = bpy.data.materials.new("TorpedoEmission")
+        mat = bpy.data.materials.new(MATERIAL_NAME)
     mat.use_nodes = True
     mat.surface_render_method = 'BLENDED'
     nodes = mat.node_tree.nodes
@@ -59,586 +781,295 @@ def create_emission_material():
 
 
 # ============================================================
-# Node Tree Builder
+# Main Builder
 # ============================================================
 
-def build_torpedo_effect():
-    """Build the TorpedoEffect GeoNodes tree.
+def build_torpedo_effect(launchpads, targets, repulsors):
+    """Build the TorpedoEffect GeoNodes tree from collections.
 
-    Architecture:
-      Controller (2-vertex mesh, one per torpedo)
-        └── TorpedoEffect GeoNodes Modifier
-              ├── Object Info nodes for Target1, Target2, Repulsor1
-              │   (reads actual scene object positions — move them to change trajectories)
-              ├── Scene Time for activation frames
-              ├── Simulation Zone
-              │     ├── State: Position, Velocity, Active, Arrived
-              │     ├── Target attraction, repulsor avoidance, speed clamping
-              │     └── Active/Arrived masking
-              ├── Set Position (apply sim results to geometry)
-              ├── Delete non-visible torpedoes
-              ├── Instance UV Sphere on remaining points
-              └── Set TorpedoEmission material
+    Creates node group with Group Interface, Simulation Zone, all sub-builders.
+    Returns the node group.
     """
-    ng_name = "TorpedoEffect"
-    old = bpy.data.node_groups.get(ng_name)
-    if old:
-        bpy.data.node_groups.remove(old)
+    n_torpedoes = len(launchpads)
+    ng = _ensure_clean_node_group(NODE_GROUP_NAME)
+    nodes = ng.nodes
+    links = ng.links
 
-    ng = bpy.data.node_groups.new(ng_name, 'GeometryNodeTree')
+    # --- Group Interface ---
     ng.interface.new_socket('Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')
     ng.interface.new_socket('Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
 
-    # --- Group Input parameter sockets ---
-    params = [
-        ("Attraction",            'NodeSocketFloat', PHYSICS["attraction"]),
-        ("Max Speed",             'NodeSocketFloat', PHYSICS["max_speed"]),
-        ("Initial Speed",         'NodeSocketFloat', PHYSICS["initial_speed"]),
-        ("Repulsor Strength Base",'NodeSocketFloat', PHYSICS["repulsor_strength_base"]),
-        ("Repulsor Radius",       'NodeSocketFloat', PHYSICS["repulsor_radius"]),
-        ("Arrival Distance",      'NodeSocketFloat', PHYSICS["arrival_distance"]),
-        ("Torpedo Radius",        'NodeSocketFloat', PHYSICS["torpedo_radius"]),
+    param_defs = [
+        ("Exit Velocity",      'NodeSocketFloat', 50.0),
+        ("Attraction",         'NodeSocketFloat', 200.0),
+        ("Max Speed",          'NodeSocketFloat', 150.0),
+        ("Repulsor Strength",  'NodeSocketFloat', 100.0),
+        ("Repulsor Radius",    'NodeSocketFloat', 150.0),
+        ("Arrival Distance",   'NodeSocketFloat', 20.0),
+        ("Torpedo Radius",     'NodeSocketFloat', 10.0),
     ]
-    for name, sock_type, default in params:
+    for name, sock_type, default in param_defs:
         sock = ng.interface.new_socket(name, in_out='INPUT', socket_type=sock_type)
         sock.default_value = default
 
-    # --- Group I/O ---
-    group_in = ng.nodes.new('NodeGroupInput')
-    group_in.location = (-1200, 0)
-    group_out = ng.nodes.new('NodeGroupOutput')
-    group_out.location = (2200, 0)
+    # --- Group I/O nodes ---
+    group_in = _add_node(nodes, 'NodeGroupInput', "GroupInput", (-1400, 0))
+    group_out = _add_node(nodes, 'NodeGroupOutput', "GroupOutput", (6000, 0))
 
     # --- Simulation Zone ---
-    sim_in = ng.nodes.new('GeometryNodeSimulationInput')
-    sim_in.location = (-600, 0)
-    sim_out = ng.nodes.new('GeometryNodeSimulationOutput')
-    sim_out.location = (800, 0)
+    sim_in = _add_node(nodes, 'GeometryNodeSimulationInput', "SimInput", (-800, 0))
+    sim_out = _add_node(nodes, 'GeometryNodeSimulationOutput', "SimOutput", (4000, 0))
     sim_in.pair_with_output(sim_out)
 
+    # State items (on sim_out, then appear on sim_in)
     sim_out.state_items.new('VECTOR', "Position")
     sim_out.state_items.new('VECTOR', "Velocity")
     sim_out.state_items.new('FLOAT', "Active")
     sim_out.state_items.new('FLOAT', "Arrived")
 
-    # Pass-through state items for parameters (Group Input → sim zone interior)
-    param_states = [
-        "AttractionParam",
-        "MaxSpeedParam",
-        "InitialSpeedParam",
-        "RepStrengthBaseParam",
-        "RepRadiusParam",
-        "ArrivalDistParam",
+    # Pass-through state items for parameters
+    param_state_names = [
+        "ExitVelParam", "AttrParam", "MaxSpeedParam",
+        "RepStrParam", "RepRadParam", "ArrDistParam",
     ]
-    for name in param_states:
+    for name in param_state_names:
         sim_out.state_items.new('FLOAT', name)
 
-    ng.links.new(group_in.outputs['Geometry'], sim_in.inputs['Geometry'])
+    # Wire Group Input → Sim Zone
+    _link(links, group_in.outputs['Geometry'], sim_in.inputs['Geometry'])
 
-    # Wire Group Inputs → sim_in state inputs (external entry into sim zone)
     gi_to_state = [
-        ("Attraction",             "AttractionParam"),
-        ("Max Speed",              "MaxSpeedParam"),
-        ("Initial Speed",          "InitialSpeedParam"),
-        ("Repulsor Strength Base", "RepStrengthBaseParam"),
-        ("Repulsor Radius",        "RepRadiusParam"),
-        ("Arrival Distance",       "ArrivalDistParam"),
+        ("Exit Velocity",     "ExitVelParam"),
+        ("Attraction",        "AttrParam"),
+        ("Max Speed",         "MaxSpeedParam"),
+        ("Repulsor Strength", "RepStrParam"),
+        ("Repulsor Radius",   "RepRadParam"),
+        ("Arrival Distance",  "ArrDistParam"),
     ]
     for gi_name, state_name in gi_to_state:
-        ng.links.new(group_in.outputs[gi_name], sim_in.inputs[state_name])
-
-    # --- Object Info nodes (read actual scene positions) ---
-    target1_info = ng.nodes.new('GeometryNodeObjectInfo')
-    target1_info.name = "Target1Info"
-    target1_info.location = (-400, -400)
-    target1_info.inputs['Object'].default_value = bpy.data.objects["Target1"]
-    target1_info.transform_space = 'ORIGINAL'
-
-    target2_info = ng.nodes.new('GeometryNodeObjectInfo')
-    target2_info.name = "Target2Info"
-    target2_info.location = (-400, -600)
-    target2_info.inputs['Object'].default_value = bpy.data.objects["Target2"]
-    target2_info.transform_space = 'ORIGINAL'
-
-    rep_info = ng.nodes.new('GeometryNodeObjectInfo')
-    rep_info.name = "Repulsor1Info"
-    rep_info.location = (-400, -800)
-    rep_info.inputs['Object'].default_value = bpy.data.objects["Repulsor1"]
-    rep_info.transform_space = 'ORIGINAL'
-
-    # --- Scene Time + Index for per-torpedo selection ---
-    scene_time = ng.nodes.new('GeometryNodeInputSceneTime')
-    scene_time.location = (-400, -200)
-
-    index = ng.nodes.new('GeometryNodeInputIndex')
-    index.location = (-400, -100)
-
-    is_t1 = ng.nodes.new('FunctionNodeCompare')
-    is_t1.name = "IsT1"
-    is_t1.location = (-200, -100)
-    is_t1.data_type = 'INT'
-    is_t1.operation = 'EQUAL'
-    is_t1.inputs[2].default_value = 0
-    is_t1.inputs[3].default_value = 0
-    ng.links.new(index.outputs['Index'], is_t1.inputs[2])
-
-    # Per-torpedo target: Mix(is_T1, Target2, Target1)
-    target_mix = ng.nodes.new('ShaderNodeMix')
-    target_mix.name = "TargetPosMix"
-    target_mix.location = (0, -400)
-    target_mix.data_type = 'VECTOR'
-    target_mix.clamp_factor = True
-    ng.links.new(is_t1.outputs['Result'], target_mix.inputs['Factor'])
-    ng.links.new(target2_info.outputs['Location'], target_mix.inputs[4])
-    ng.links.new(target1_info.outputs['Location'], target_mix.inputs[5])
-
-    # Per-torpedo launch frame: Mix(is_T1, T2_frame, T1_frame)
-    launch_mix = ng.nodes.new('ShaderNodeMix')
-    launch_mix.name = "LaunchFrameMix"
-    launch_mix.location = (0, -200)
-    launch_mix.data_type = 'FLOAT'
-    launch_mix.clamp_factor = True
-    launch_mix.inputs[2].default_value = float(TORPEDO_CONFIG["Torpedo2"]["launch_frame"])
-    launch_mix.inputs[3].default_value = float(TORPEDO_CONFIG["Torpedo1"]["launch_frame"])
-    ng.links.new(is_t1.outputs['Result'], launch_mix.inputs['Factor'])
-
-    # Activation: frame > launch_frame - 0.5
-    launch_threshold = ng.nodes.new('ShaderNodeMath')
-    launch_threshold.name = "LaunchThreshold"
-    launch_threshold.location = (200, -300)
-    launch_threshold.operation = 'SUBTRACT'
-    launch_threshold.inputs[1].default_value = 0.5
-    ng.links.new(launch_mix.outputs[0], launch_threshold.inputs[0])
-
-    activation_check = ng.nodes.new('ShaderNodeMath')
-    activation_check.name = "ActivationCheck"
-    activation_check.location = (200, -200)
-    activation_check.operation = 'GREATER_THAN'
-    ng.links.new(scene_time.outputs['Frame'], activation_check.inputs[0])
-    ng.links.new(launch_threshold.outputs[0], activation_check.inputs[1])
-
-    # --- Active latching ---
-    active_latch = ng.nodes.new('ShaderNodeMath')
-    active_latch.name = "ActiveLatch"
-    active_latch.location = (400, -200)
-    active_latch.operation = 'MAXIMUM'
-    ng.links.new(sim_in.outputs['Active'], active_latch.inputs[0])
-    ng.links.new(activation_check.outputs[0], active_latch.inputs[1])
-
-    # --- Start Position ---
-    start_pos = ng.nodes.new('GeometryNodeInputPosition')
-    start_pos.name = "StartPosition"
-    start_pos.location = (-400, 200)
-
-    # --- Target attraction ---
-    to_target = ng.nodes.new('ShaderNodeVectorMath')
-    to_target.name = "ToTarget"
-    to_target.location = (200, -500)
-    to_target.operation = 'SUBTRACT'
-    ng.links.new(target_mix.outputs[1], to_target.inputs[0])
-    ng.links.new(sim_in.outputs['Position'], to_target.inputs[1])
-
-    dist_to_target = ng.nodes.new('ShaderNodeVectorMath')
-    dist_to_target.name = "DistToTarget"
-    dist_to_target.location = (400, -500)
-    dist_to_target.operation = 'LENGTH'
-    ng.links.new(to_target.outputs['Vector'], dist_to_target.inputs[0])
-
-    norm_to_target = ng.nodes.new('ShaderNodeVectorMath')
-    norm_to_target.name = "NormToTarget"
-    norm_to_target.location = (400, -600)
-    norm_to_target.operation = 'NORMALIZE'
-    ng.links.new(to_target.outputs['Vector'], norm_to_target.inputs[0])
-
-    # Attraction boost: stronger as torpedo gets closer to target
-    # effective_attraction = Attraction * (1 + RefDist / dist_to_target)
-    ref_over_dist = ng.nodes.new('ShaderNodeMath')
-    ref_over_dist.name = "RefOverDist"
-    ref_over_dist.location = (500, -700)
-    ref_over_dist.operation = 'DIVIDE'
-    ref_over_dist.inputs[0].default_value = 1000.0  # reference distance for close-range boost
-    ng.links.new(dist_to_target.outputs['Value'], ref_over_dist.inputs[1])
-
-    one_plus_boost = ng.nodes.new('ShaderNodeMath')
-    one_plus_boost.name = "OnePlusBoost"
-    one_plus_boost.location = (500, -600)
-    one_plus_boost.operation = 'ADD'
-    one_plus_boost.inputs[0].default_value = 1.0
-    ng.links.new(ref_over_dist.outputs[0], one_plus_boost.inputs[1])
-
-    effective_attr = ng.nodes.new('ShaderNodeMath')
-    effective_attr.name = "EffectiveAttraction"
-    effective_attr.location = (550, -550)
-    effective_attr.operation = 'MULTIPLY'
-    ng.links.new(sim_in.outputs['AttractionParam'], effective_attr.inputs[0])
-    ng.links.new(one_plus_boost.outputs[0], effective_attr.inputs[1])
-
-    attr_scale = ng.nodes.new('ShaderNodeVectorMath')
-    attr_scale.name = "AttractionScale"
-    attr_scale.location = (600, -600)
-    attr_scale.operation = 'SCALE'
-    ng.links.new(norm_to_target.outputs['Vector'], attr_scale.inputs[0])
-    ng.links.new(effective_attr.outputs[0], attr_scale.inputs[3])
-
-    # --- Arrival detection ---
-    arrival_check = ng.nodes.new('ShaderNodeMath')
-    arrival_check.name = "ArrivalCheck"
-    arrival_check.location = (600, -400)
-    arrival_check.operation = 'LESS_THAN'
-    ng.links.new(dist_to_target.outputs['Value'], arrival_check.inputs[0])
-    ng.links.new(sim_in.outputs['ArrivalDistParam'], arrival_check.inputs[1])
-
-    arrived_latch = ng.nodes.new('ShaderNodeMath')
-    arrived_latch.name = "ArrivedLatch"
-    arrived_latch.location = (800, -400)
-    arrived_latch.operation = 'MAXIMUM'
-    ng.links.new(sim_in.outputs['Arrived'], arrived_latch.inputs[0])
-    ng.links.new(arrival_check.outputs[0], arrived_latch.inputs[1])
-
-    # --- Repulsor avoidance ---
-    away = ng.nodes.new('ShaderNodeVectorMath')
-    away.name = "AwayFromRepulsor"
-    away.location = (200, -800)
-    away.operation = 'SUBTRACT'
-    ng.links.new(sim_in.outputs['Position'], away.inputs[0])
-    ng.links.new(rep_info.outputs['Location'], away.inputs[1])
-
-    dist_rep = ng.nodes.new('ShaderNodeVectorMath')
-    dist_rep.name = "DistToRepulsor"
-    dist_rep.location = (400, -800)
-    dist_rep.operation = 'LENGTH'
-    ng.links.new(away.outputs['Vector'], dist_rep.inputs[0])
-
-    dist_norm = ng.nodes.new('ShaderNodeMath')
-    dist_norm.name = "RepDistNorm"
-    dist_norm.location = (400, -900)
-    dist_norm.operation = 'DIVIDE'
-    ng.links.new(dist_rep.outputs['Value'], dist_norm.inputs[0])
-    ng.links.new(sim_in.outputs['RepRadiusParam'], dist_norm.inputs[1])
-
-    falloff_sub = ng.nodes.new('ShaderNodeMath')
-    falloff_sub.name = "RepFalloffSub"
-    falloff_sub.location = (600, -900)
-    falloff_sub.operation = 'SUBTRACT'
-    falloff_sub.inputs[0].default_value = 1.0
-    ng.links.new(dist_norm.outputs[0], falloff_sub.inputs[1])
-
-    falloff = ng.nodes.new('ShaderNodeMath')
-    falloff.name = "RepFalloff"
-    falloff.location = (800, -900)
-    falloff.operation = 'MAXIMUM'
-    falloff.inputs[1].default_value = 0.0
-    ng.links.new(falloff_sub.outputs[0], falloff.inputs[0])
-
-    norm_away = ng.nodes.new('ShaderNodeVectorMath')
-    norm_away.name = "NormAway"
-    norm_away.location = (600, -800)
-    norm_away.operation = 'NORMALIZE'
-    ng.links.new(away.outputs['Vector'], norm_away.inputs[0])
-
-    # Repulsor strength driven by object scale
-    sep_scale = ng.nodes.new('ShaderNodeSeparateXYZ')
-    sep_scale.name = "RepSepScale"
-    sep_scale.location = (800, -1050)
-    ng.links.new(rep_info.outputs['Scale'], sep_scale.inputs['Vector'])
-
-    scale_strength = ng.nodes.new('ShaderNodeMath')
-    scale_strength.name = "RepScaleStrength"
-    scale_strength.location = (1000, -1000)
-    scale_strength.operation = 'MULTIPLY'
-    ng.links.new(sep_scale.outputs['X'], scale_strength.inputs[0])
-    ng.links.new(sim_in.outputs['RepStrengthBaseParam'], scale_strength.inputs[1])
-
-    strength_falloff = ng.nodes.new('ShaderNodeMath')
-    strength_falloff.name = "RepStrengthFalloff"
-    strength_falloff.location = (1000, -900)
-    strength_falloff.operation = 'MULTIPLY'
-    ng.links.new(scale_strength.outputs[0], strength_falloff.inputs[0])
-    ng.links.new(falloff.outputs[0], strength_falloff.inputs[1])
-
-    rep_force = ng.nodes.new('ShaderNodeVectorMath')
-    rep_force.name = "RepulsorForce"
-    rep_force.location = (1000, -800)
-    rep_force.operation = 'SCALE'
-    ng.links.new(norm_away.outputs['Vector'], rep_force.inputs[0])
-    ng.links.new(strength_falloff.outputs[0], rep_force.inputs[3])
-
-    # --- Repulsor gate: only active when torpedo hasn't passed it ---
-    # If torpedo is closer to target than repulsor is, torpedo has passed → ignore repulsor
-    rep_to_target = ng.nodes.new('ShaderNodeVectorMath')
-    rep_to_target.name = "RepToTarget"
-    rep_to_target.location = (400, -1100)
-    rep_to_target.operation = 'SUBTRACT'
-    ng.links.new(target_mix.outputs[1], rep_to_target.inputs[0])
-    ng.links.new(rep_info.outputs['Location'], rep_to_target.inputs[1])
-
-    dist_rep_target = ng.nodes.new('ShaderNodeVectorMath')
-    dist_rep_target.name = "DistRepToTarget"
-    dist_rep_target.location = (600, -1100)
-    dist_rep_target.operation = 'LENGTH'
-    ng.links.new(rep_to_target.outputs['Vector'], dist_rep_target.inputs[0])
-
-    rep_gate = ng.nodes.new('ShaderNodeMath')
-    rep_gate.name = "RepGate"
-    rep_gate.location = (800, -1100)
-    rep_gate.operation = 'GREATER_THAN'
-    ng.links.new(dist_to_target.outputs['Value'], rep_gate.inputs[0])
-    ng.links.new(dist_rep_target.outputs['Value'], rep_gate.inputs[1])
-
-    gated_rep = ng.nodes.new('ShaderNodeVectorMath')
-    gated_rep.name = "GatedRepForce"
-    gated_rep.location = (1100, -900)
-    gated_rep.operation = 'SCALE'
-    ng.links.new(rep_force.outputs['Vector'], gated_rep.inputs[0])
-    ng.links.new(rep_gate.outputs[0], gated_rep.inputs[3])
-
-    # --- Velocity update ---
-    total_force = ng.nodes.new('ShaderNodeVectorMath')
-    total_force.name = "TotalForce"
-    total_force.location = (1200, -600)
-    total_force.operation = 'ADD'
-    ng.links.new(attr_scale.outputs['Vector'], total_force.inputs[0])
-    ng.links.new(gated_rep.outputs['Vector'], total_force.inputs[1])
-
-    force_dt = ng.nodes.new('ShaderNodeVectorMath')
-    force_dt.name = "ForceDt"
-    force_dt.location = (1200, -500)
-    force_dt.operation = 'SCALE'
-    ng.links.new(total_force.outputs['Vector'], force_dt.inputs[0])
-    ng.links.new(sim_in.outputs['Delta Time'], force_dt.inputs[3])
-
-    new_vel = ng.nodes.new('ShaderNodeVectorMath')
-    new_vel.name = "NewVel"
-    new_vel.location = (1400, -500)
-    new_vel.operation = 'ADD'
-    ng.links.new(sim_in.outputs['Velocity'], new_vel.inputs[0])
-    ng.links.new(force_dt.outputs['Vector'], new_vel.inputs[1])
-
-    # Speed clamping
-    vel_len = ng.nodes.new('ShaderNodeVectorMath')
-    vel_len.name = "VelLength"
-    vel_len.location = (1400, -600)
-    vel_len.operation = 'LENGTH'
-    ng.links.new(new_vel.outputs['Vector'], vel_len.inputs[0])
-
-    clamped_len = ng.nodes.new('ShaderNodeMath')
-    clamped_len.name = "ClampedLen"
-    clamped_len.location = (1600, -600)
-    clamped_len.operation = 'MINIMUM'
-    ng.links.new(vel_len.outputs['Value'], clamped_len.inputs[0])
-    ng.links.new(sim_in.outputs['MaxSpeedParam'], clamped_len.inputs[1])
-
-    scale_factor = ng.nodes.new('ShaderNodeMath')
-    scale_factor.name = "ScaleFactor"
-    scale_factor.location = (1600, -700)
-    scale_factor.operation = 'DIVIDE'
-    ng.links.new(clamped_len.outputs[0], scale_factor.inputs[0])
-    ng.links.new(vel_len.outputs['Value'], scale_factor.inputs[1])
-
-    cap = ng.nodes.new('ShaderNodeMath')
-    cap.name = "Cap"
-    cap.location = (1800, -700)
-    cap.operation = 'MINIMUM'
-    cap.inputs[1].default_value = 1.0
-    ng.links.new(scale_factor.outputs[0], cap.inputs[0])
-
-    clamped_vel = ng.nodes.new('ShaderNodeVectorMath')
-    clamped_vel.name = "ClampedVel"
-    clamped_vel.location = (1800, -500)
-    clamped_vel.operation = 'SCALE'
-    ng.links.new(new_vel.outputs['Vector'], clamped_vel.inputs[0])
-    ng.links.new(cap.outputs[0], clamped_vel.inputs[3])
-
-    # --- Launch impulse ---
-    prev_vel_len = ng.nodes.new('ShaderNodeVectorMath')
-    prev_vel_len.name = "PrevVelLen"
-    prev_vel_len.location = (400, -300)
-    prev_vel_len.operation = 'LENGTH'
-    ng.links.new(sim_in.outputs['Velocity'], prev_vel_len.inputs[0])
-
-    is_first_frame = ng.nodes.new('ShaderNodeMath')
-    is_first_frame.name = "IsFirstFrame"
-    is_first_frame.location = (600, -300)
-    is_first_frame.operation = 'LESS_THAN'
-    is_first_frame.inputs[1].default_value = 0.001
-    ng.links.new(prev_vel_len.outputs['Value'], is_first_frame.inputs[0])
-
-    launch_impulse = ng.nodes.new('ShaderNodeVectorMath')
-    launch_impulse.name = "LaunchImpulse"
-    launch_impulse.location = (600, -200)
-    launch_impulse.operation = 'SCALE'
-    ng.links.new(norm_to_target.outputs['Vector'], launch_impulse.inputs[0])
-    ng.links.new(sim_in.outputs['InitialSpeedParam'], launch_impulse.inputs[3])
-
-    launch_active = ng.nodes.new('ShaderNodeMath')
-    launch_active.name = "LaunchActive"
-    launch_active.location = (800, -300)
-    launch_active.operation = 'MULTIPLY'
-    ng.links.new(active_latch.outputs[0], launch_active.inputs[0])
-    ng.links.new(is_first_frame.outputs[0], launch_active.inputs[1])
-
-    vel_select = ng.nodes.new('ShaderNodeMix')
-    vel_select.name = "VelSelect"
-    vel_select.location = (2000, -400)
-    vel_select.data_type = 'VECTOR'
-    vel_select.clamp_factor = True
-    ng.links.new(launch_active.outputs[0], vel_select.inputs['Factor'])
-    ng.links.new(clamped_vel.outputs['Vector'], vel_select.inputs[4])
-    ng.links.new(launch_impulse.outputs['Vector'], vel_select.inputs[5])
-
-    # --- Active/Arrived masking ---
-    one_minus_arrived = ng.nodes.new('ShaderNodeMath')
-    one_minus_arrived.name = "OneMinusArrived"
-    one_minus_arrived.location = (1000, -200)
-    one_minus_arrived.operation = 'SUBTRACT'
-    one_minus_arrived.inputs[0].default_value = 1.0
-    ng.links.new(arrived_latch.outputs[0], one_minus_arrived.inputs[1])
-
-    active_mask = ng.nodes.new('ShaderNodeMath')
-    active_mask.name = "ActiveMask"
-    active_mask.location = (1200, -200)
-    active_mask.operation = 'MULTIPLY'
-    ng.links.new(active_latch.outputs[0], active_mask.inputs[0])
-    ng.links.new(one_minus_arrived.outputs[0], active_mask.inputs[1])
-
-    final_vel = ng.nodes.new('ShaderNodeVectorMath')
-    final_vel.name = "FinalVel"
-    final_vel.location = (2200, -400)
-    final_vel.operation = 'SCALE'
-    ng.links.new(vel_select.outputs[1], final_vel.inputs[0])
-    ng.links.new(active_mask.outputs[0], final_vel.inputs[3])
-
-    # --- Position update ---
-    vel_dt = ng.nodes.new('ShaderNodeVectorMath')
-    vel_dt.name = "VelDt"
-    vel_dt.location = (2400, -400)
-    vel_dt.operation = 'SCALE'
-    ng.links.new(final_vel.outputs['Vector'], vel_dt.inputs[0])
-    ng.links.new(sim_in.outputs['Delta Time'], vel_dt.inputs[3])
-
-    new_pos = ng.nodes.new('ShaderNodeVectorMath')
-    new_pos.name = "NewPos"
-    new_pos.location = (2600, -400)
-    new_pos.operation = 'ADD'
-    ng.links.new(sim_in.outputs['Position'], new_pos.inputs[0])
-    ng.links.new(vel_dt.outputs['Vector'], new_pos.inputs[1])
-
-    pos_select = ng.nodes.new('ShaderNodeMix')
-    pos_select.name = "PosSelect"
-    pos_select.location = (2800, -400)
-    pos_select.data_type = 'VECTOR'
-    pos_select.clamp_factor = True
-    ng.links.new(active_latch.outputs[0], pos_select.inputs['Factor'])
-    ng.links.new(start_pos.outputs['Position'], pos_select.inputs[4])
-    ng.links.new(new_pos.outputs['Vector'], pos_select.inputs[5])
-
-    # --- Wire to sim zone output ---
-    ng.links.new(sim_in.outputs['Geometry'], sim_out.inputs['Geometry'])
-    ng.links.new(pos_select.outputs[1], sim_out.inputs['Position'])
-    ng.links.new(final_vel.outputs['Vector'], sim_out.inputs['Velocity'])
-    ng.links.new(active_latch.outputs[0], sim_out.inputs['Active'])
-    ng.links.new(arrived_latch.outputs[0], sim_out.inputs['Arrived'])
-
-    # Pass-through state items: sim_in → sim_out (so values persist each frame)
-    for state_name in param_states:
-        ng.links.new(sim_in.outputs[state_name], sim_out.inputs[state_name])
-
-    # === POST-SIM ZONE ===
-
-    # Set Position
-    set_pos = ng.nodes.new('GeometryNodeSetPosition')
-    set_pos.name = "SetPosition"
-    set_pos.location = (1000, 0)
-    ng.links.new(sim_out.outputs['Geometry'], set_pos.inputs['Geometry'])
-    ng.links.new(sim_out.outputs['Position'], set_pos.inputs['Position'])
-
-    # Visibility filter
-    vis_inv = ng.nodes.new('ShaderNodeMath')
-    vis_inv.name = "OneMinusArrivedPost"
-    vis_inv.location = (1000, -100)
-    vis_inv.operation = 'SUBTRACT'
-    vis_inv.inputs[0].default_value = 1.0
-    ng.links.new(sim_out.outputs['Arrived'], vis_inv.inputs[1])
-
-    vis_mask = ng.nodes.new('ShaderNodeMath')
-    vis_mask.name = "VisibilityMask"
-    vis_mask.location = (1200, -100)
-    vis_mask.operation = 'MULTIPLY'
-    ng.links.new(sim_out.outputs['Active'], vis_mask.inputs[0])
-    ng.links.new(vis_inv.outputs[0], vis_mask.inputs[1])
-
-    vis_invert = ng.nodes.new('ShaderNodeMath')
-    vis_invert.name = "VisInvert"
-    vis_invert.location = (1200, 0)
-    vis_invert.operation = 'SUBTRACT'
-    vis_invert.inputs[0].default_value = 1.0
-    ng.links.new(vis_mask.outputs[0], vis_invert.inputs[1])
-
-    vis_bool = ng.nodes.new('ShaderNodeMath')
-    vis_bool.name = "VisBool"
-    vis_bool.location = (1400, 0)
-    vis_bool.operation = 'GREATER_THAN'
-    vis_bool.inputs[1].default_value = 0.5
-    ng.links.new(vis_invert.outputs[0], vis_bool.inputs[0])
-
-    delete = ng.nodes.new('GeometryNodeDeleteGeometry')
-    delete.name = "DeleteInvisible"
-    delete.location = (1400, 100)
-    delete.domain = 'POINT'
-    ng.links.new(set_pos.outputs['Geometry'], delete.inputs['Geometry'])
-    ng.links.new(vis_bool.outputs[0], delete.inputs['Selection'])
-
-    # Instance torpedo spheres
-    uv_sphere = ng.nodes.new('GeometryNodeMeshUVSphere')
-    uv_sphere.name = "TorpedoSphere"
-    uv_sphere.location = (1400, 300)
-    uv_sphere.inputs['Segments'].default_value = 16
-    uv_sphere.inputs['Rings'].default_value = 8
-    ng.links.new(group_in.outputs['Torpedo Radius'], uv_sphere.inputs['Radius'])
-
-    instance_pts = ng.nodes.new('GeometryNodeInstanceOnPoints')
-    instance_pts.name = "InstanceOnPoints"
-    instance_pts.location = (1600, 100)
-    ng.links.new(delete.outputs['Geometry'], instance_pts.inputs['Points'])
-    ng.links.new(uv_sphere.outputs['Mesh'], instance_pts.inputs['Instance'])
-
-    realize = ng.nodes.new('GeometryNodeRealizeInstances')
-    realize.name = "Realize"
-    realize.location = (1800, 100)
-    ng.links.new(instance_pts.outputs['Instances'], realize.inputs['Geometry'])
-
-    mat = bpy.data.materials.get("TorpedoEmission")
-    set_mat = ng.nodes.new('GeometryNodeSetMaterial')
-    set_mat.name = "SetMaterial"
-    set_mat.location = (2000, 100)
-    set_mat.inputs['Material'].default_value = mat
-    ng.links.new(realize.outputs['Geometry'], set_mat.inputs['Geometry'])
-
-    ng.links.new(set_mat.outputs['Geometry'], group_out.inputs['Geometry'])
-
+        _link(links, group_in.outputs[gi_name], sim_in.inputs[state_name])
+
+    # Pass-through: sim_in → sim_out (persist each frame)
+    _link(links, sim_in.outputs['Geometry'], sim_out.inputs['Geometry'])
+    for state_name in param_state_names:
+        _link(links, sim_in.outputs[state_name], sim_out.inputs[state_name])
+
+    # --- Object Info nodes inside Sim Zone ---
+    lp_infos = _create_object_info_nodes(
+        nodes, launchpads, "LP", -600, -400, 200,
+    )
+    tgt_infos = _create_object_info_nodes(
+        nodes, targets, "TGT", -600, -400 - len(launchpads) * 200 - 200, 200,
+    )
+    rep_infos = _create_object_info_nodes(
+        nodes, repulsors, "REP", -600,
+        -400 - (len(launchpads) + len(targets)) * 200 - 400, 200,
+    )
+
+    # Collect per-torpedo sockets for mux chains
+    lp_scale_sockets = [info.outputs['Scale'] for info in lp_infos]
+    lp_rotation_sockets = [info.outputs['Rotation'] for info in lp_infos]
+    tgt_pos_sockets = [info.outputs['Location'] for info in tgt_infos]
+
+    # --- Build per-torpedo target position mux ---
+    target_pos_socket = _build_cascading_mux(
+        nodes, links, tgt_pos_sockets, 'VECTOR',
+        "TgtPos", 0, y_offset=-1400,
+    )
+
+    # --- Sub-builder: Launch ---
+    active_socket, launch_mask_socket, initial_vel_socket = _build_launch(
+        nodes, links,
+        lp_scale_sockets=lp_scale_sockets,
+        lp_rotation_sockets=lp_rotation_sockets,
+        exit_vel_socket=sim_in.outputs['ExitVelParam'],
+        prev_active_socket=sim_in.outputs['Active'],
+        prev_velocity_socket=sim_in.outputs['Velocity'],
+        x_offset=600,
+    )
+
+    # --- Sub-builder: Repulsors ---
+    # Need dist_to_target for pass-gate, but velocity_integration computes it.
+    # Build repulsors with a temporary dist_to_target computation.
+    # Actually, repulsor forces need position and target_pos, and dist_to_target.
+    # We compute dist_to_target here for repulsor gating.
+    temp_to_target = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "TempToTarget", (600, -1800),
+    )
+    temp_to_target.operation = 'SUBTRACT'
+    _link(links, target_pos_socket, temp_to_target.inputs[0])
+    _link(links, sim_in.outputs['Position'], temp_to_target.inputs[1])
+
+    temp_dist = _add_node(
+        nodes, 'ShaderNodeVectorMath',
+        "TempDist", (800, -1800),
+    )
+    temp_dist.operation = 'LENGTH'
+    _link(links, temp_to_target.outputs['Vector'], temp_dist.inputs[0])
+
+    repulsor_force_socket = _build_repulsor_forces(
+        nodes, links,
+        position_socket=sim_in.outputs['Position'],
+        target_pos_socket=target_pos_socket,
+        dist_to_target_socket=temp_dist.outputs['Value'],
+        repulsor_info_nodes=rep_infos,
+        rep_strength_socket=sim_in.outputs['RepStrParam'],
+        rep_radius_socket=sim_in.outputs['RepRadParam'],
+        x_offset=1000,
+    )
+
+    # --- Sub-builder: Velocity Integration ---
+    vel_socket, pos_socket, dist_socket = _build_velocity_integration(
+        nodes, links,
+        velocity_socket=initial_vel_socket,
+        position_socket=sim_in.outputs['Position'],
+        target_pos_socket=target_pos_socket,
+        attraction_socket=sim_in.outputs['AttrParam'],
+        repulsor_force_socket=repulsor_force_socket,
+        active_socket=active_socket,
+        arrived_socket=sim_in.outputs['Arrived'],
+        max_speed_socket=sim_in.outputs['MaxSpeedParam'],
+        delta_time_socket=sim_in.outputs['Delta Time'],
+        x_offset=2000,
+    )
+
+    # --- Sub-builder: Arrival Detection ---
+    arrived_socket, final_pos_socket, final_vel_socket = _build_arrival_detection(
+        nodes, links,
+        position_socket=pos_socket,
+        target_pos_socket=target_pos_socket,
+        velocity_socket=vel_socket,
+        dist_to_target_socket=dist_socket,
+        arrival_dist_socket=sim_in.outputs['ArrDistParam'],
+        prev_arrived_socket=sim_in.outputs['Arrived'],
+        x_offset=4600,
+    )
+
+    # --- Wire to Sim Zone output ---
+    _link(links, final_pos_socket, sim_out.inputs['Position'])
+    _link(links, final_vel_socket, sim_out.inputs['Velocity'])
+    _link(links, active_socket, sim_out.inputs['Active'])
+    _link(links, arrived_socket, sim_out.inputs['Arrived'])
+
+    # --- Post-sim visual output ---
+    mat = _create_torpedo_material()
+    final_geo = _build_visual_output(
+        nodes, links,
+        geo_socket=sim_out.outputs['Geometry'],
+        position_socket=sim_out.outputs['Position'],
+        active_socket=sim_out.outputs['Active'],
+        arrived_socket=sim_out.outputs['Arrived'],
+        torpedo_radius_socket=group_in.outputs['Torpedo Radius'],
+        material=mat,
+        x_offset=4400,
+    )
+
+    _link(links, final_geo, group_out.inputs['Geometry'])
+
+    print(f"  Built TorpedoEffect with {n_torpedoes} torpedoes, "
+          f"{len(repulsors)} repulsors.")
     return ng
 
 
 # ============================================================
-# Main
+# Test Scene Setup
 # ============================================================
 
-if __name__ == "__main__":
-    create_emission_material()
-    ng = build_torpedo_effect()
+def setup_test_scene(num_launchpads=4):
+    """Create a test scene with launchpads, targets, repulsors, and keyframes."""
+    # Ensure collections exist
+    for col_name in (LAUNCHPAD_COLLECTION, TARGET_COLLECTION, REPULSOR_COLLECTION):
+        if col_name not in bpy.data.collections:
+            col = bpy.data.collections.new(col_name)
+            bpy.context.scene.collection.children.link(col)
 
-    ctrl = bpy.data.objects["TorpedoController"]
+    lp_col = bpy.data.collections[LAUNCHPAD_COLLECTION]
+    tgt_col = bpy.data.collections[TARGET_COLLECTION]
+    rep_col = bpy.data.collections[REPULSOR_COLLECTION]
+
+    # Clear existing objects in collections
+    for col in (lp_col, tgt_col, rep_col):
+        for obj in list(col.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    # Create launchpads (arrow empties, left side)
+    for i in range(num_launchpads):
+        empty = bpy.data.objects.new(f"LP.{i+1:03d}", None)
+        empty.empty_display_type = 'SINGLE_ARROW'
+        empty.empty_display_size = 20.0
+        empty.location = (-300, -150 + i * 100, 0)
+        # Point toward +X (rotate 90 deg around Z)
+        empty.rotation_euler = (0, 0, radians(-90))
+        empty.scale = (0, 0, 0)  # Start inactive
+        lp_col.objects.link(empty)
+
+        # Keyframe scale: activate at staggered frames
+        activate_frame = 10 + i * 8
+        empty.keyframe_insert(data_path="scale", frame=1)
+        empty.scale = (1, 1, 1)
+        empty.keyframe_insert(data_path="scale", frame=activate_frame)
+
+        # Set constant interpolation
+        if empty.animation_data and empty.animation_data.action:
+            action = empty.animation_data.action
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for bag in strip.channelbags:
+                        for fcurve in bag.fcurves:
+                            for kp in fcurve.keyframe_points:
+                                kp.interpolation = 'CONSTANT'
+
+    # Create targets (empties, right side)
+    for i in range(num_launchpads):
+        empty = bpy.data.objects.new(f"TGT.{i+1:03d}", None)
+        empty.empty_display_type = 'SPHERE'
+        empty.empty_display_size = 15.0
+        empty.location = (500, -150 + i * 100, 0)
+        tgt_col.objects.link(empty)
+
+    # Create repulsors (cubes, middle area)
+    for i in range(2):
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=30.0)
+        mesh = bpy.data.meshes.new(f"REP.{i+1:03d}")
+        bm.to_mesh(mesh)
+        bm.free()
+        obj = bpy.data.objects.new(f"REP.{i+1:03d}", mesh)
+        obj.location = (100, -50 + i * 100, 0)
+        obj.display_type = 'WIRE'
+        rep_col.objects.link(obj)
+
+    print(f"  Test scene: {num_launchpads} launchpads, {num_launchpads} targets, 2 repulsors.")
+
+
+# ============================================================
+# Entry Point
+# ============================================================
+
+def main():
+    """Validate collections, build node tree, apply modifier."""
+    launchpads, targets, repulsors = _validate_collections()
+    n = len(launchpads)
+
+    ctrl = _create_controller_mesh(n)
+    ng = build_torpedo_effect(launchpads, targets, repulsors)
+
+    # Apply modifier
     for mod in list(ctrl.modifiers):
         ctrl.modifiers.remove(mod)
-    mod = ctrl.modifiers.new("TorpedoEffect", 'NODES')
+    mod = ctrl.modifiers.new(NODE_GROUP_NAME, 'NODES')
     mod.node_group = ng
 
-    # Set modifier override values for Group Input parameters
-    # (Socket identifiers use Socket_N format based on interface order)
-    for key in mod.keys():
-        if not key.startswith("_"):
-            print(f"  modifier key: {key} = {mod[key]}")
+    print(f"\nTorpedoEffect applied to {CONTROLLER_NAME} with {n} torpedoes.")
+    print(f"Collections: {LAUNCHPAD_COLLECTION}, {TARGET_COLLECTION}, {REPULSOR_COLLECTION}")
+    print("Adjust physics params in the modifier properties.")
 
-    print("\nTorpedoEffect applied to TorpedoController.")
-    print("Move Target1, Target2, Repulsor1 to change trajectories.")
-    print("Adjust Attraction, Max Speed, etc. in the modifier properties.")
+
+if __name__ == "__main__":
+    # If collections don't exist yet, set up test scene first
+    if LAUNCHPAD_COLLECTION not in bpy.data.collections:
+        print("No collections found — creating test scene...")
+        setup_test_scene(num_launchpads=4)
+
+    main()
