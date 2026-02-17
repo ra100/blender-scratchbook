@@ -248,7 +248,7 @@ def _build_launch(nodes, links, lp_scale_sockets, lp_rotation_sockets,
         nodes, 'FunctionNodeRotateVector',
         "RotateForward", (x + 600, -600),
     )
-    rotate_vec.inputs['Vector'].default_value = (0.0, 1.0, 0.0)  # +Y forward
+    rotate_vec.inputs['Vector'].default_value = (0.0, 0.0, 1.0)  # +Z = SINGLE_ARROW forward
     _link(links, lp_rot_socket, rotate_vec.inputs['Rotation'])
 
     # --- Launch impulse: forward * exit_velocity * launch_mask ---
@@ -1024,8 +1024,8 @@ def setup_test_scene(num_launchpads=4):
         empty.empty_display_type = 'SINGLE_ARROW'
         empty.empty_display_size = 20.0
         empty.location = (-300, -150 + i * 100, 0)
-        # Point toward +X (rotate 90 deg around Z)
-        empty.rotation_euler = (0, 0, radians(-90))
+        # Point toward +X (rotate arrow's +Z toward +X via Y-axis rotation)
+        empty.rotation_euler = (0, radians(90), 0)
         empty.scale = (0, 0, 0)  # Start inactive
         lp_col.objects.link(empty)
 
