@@ -187,11 +187,13 @@ def _build_latch(nodes, links, check_socket, prev_socket, label, location):
 # ============================================================
 
 def _build_launch(nodes, links, lp_scale_sockets, lp_rotation_sockets,
-                  exit_vel_socket, prev_active_socket, prev_velocity_socket,
+                  lp_position_sockets, exit_vel_socket,
+                  prev_active_socket, prev_velocity_socket, prev_position_socket,
                   x_offset):
-    """Build activation detection and launch impulse.
+    """Build activation detection, launch impulse, and spawn position.
 
-    Returns (active_socket, launch_mask_socket, initial_velocity_socket).
+    Returns (active_socket, launch_mask_socket, initial_velocity_socket,
+             spawn_position_socket).
     """
     x = x_offset
 
@@ -205,6 +207,12 @@ def _build_launch(nodes, links, lp_scale_sockets, lp_rotation_sockets,
     lp_rot_socket = _build_cascading_mux(
         nodes, links, lp_rotation_sockets, 'VECTOR',
         "LPRot", x, y_offset=-800,
+    )
+
+    # --- Per-torpedo launchpad position (via cascading mux) ---
+    lp_pos_socket = _build_cascading_mux(
+        nodes, links, lp_position_sockets, 'VECTOR',
+        "LPPos", x, y_offset=-1400,
     )
 
     # --- Activation: scale vector length > threshold ---
@@ -269,7 +277,19 @@ def _build_launch(nodes, links, lp_scale_sockets, lp_rotation_sockets,
     _link(links, prev_velocity_socket, initial_velocity.inputs[0])
     _link(links, impulse_masked.outputs['Vector'], initial_velocity.inputs[1])
 
-    return active_socket, launch_mask.outputs[0], initial_velocity.outputs['Vector']
+    # --- Spawn position: on launch frame, snap to launchpad position ---
+    spawn_pos = _add_node(
+        nodes, 'ShaderNodeMix',
+        "SpawnPos", (x + 1200, -1400),
+    )
+    spawn_pos.data_type = 'VECTOR'
+    spawn_pos.clamp_factor = True
+    _link(links, launch_mask.outputs[0], spawn_pos.inputs['Factor'])
+    _link(links, prev_position_socket, spawn_pos.inputs[4])   # A: keep prev pos
+    _link(links, lp_pos_socket, spawn_pos.inputs[5])           # B: launchpad pos
+
+    return (active_socket, launch_mask.outputs[0],
+            initial_velocity.outputs['Vector'], spawn_pos.outputs[1])
 
 
 def _build_velocity_integration(nodes, links, velocity_socket, position_socket,
@@ -869,6 +889,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     # Collect per-torpedo sockets for mux chains
     lp_scale_sockets = [info.outputs['Scale'] for info in lp_infos]
     lp_rotation_sockets = [info.outputs['Rotation'] for info in lp_infos]
+    lp_position_sockets = [info.outputs['Location'] for info in lp_infos]
     tgt_pos_sockets = [info.outputs['Location'] for info in tgt_infos]
 
     # --- Build per-torpedo target position mux ---
@@ -878,14 +899,18 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     )
 
     # --- Sub-builder: Launch ---
-    active_socket, launch_mask_socket, initial_vel_socket = _build_launch(
-        nodes, links,
-        lp_scale_sockets=lp_scale_sockets,
-        lp_rotation_sockets=lp_rotation_sockets,
-        exit_vel_socket=sim_in.outputs['ExitVelParam'],
-        prev_active_socket=sim_in.outputs['Active'],
-        prev_velocity_socket=sim_in.outputs['Velocity'],
-        x_offset=600,
+    active_socket, launch_mask_socket, initial_vel_socket, spawn_pos_socket = (
+        _build_launch(
+            nodes, links,
+            lp_scale_sockets=lp_scale_sockets,
+            lp_rotation_sockets=lp_rotation_sockets,
+            lp_position_sockets=lp_position_sockets,
+            exit_vel_socket=sim_in.outputs['ExitVelParam'],
+            prev_active_socket=sim_in.outputs['Active'],
+            prev_velocity_socket=sim_in.outputs['Velocity'],
+            prev_position_socket=sim_in.outputs['Position'],
+            x_offset=600,
+        )
     )
 
     # --- Sub-builder: Repulsors ---
@@ -899,7 +924,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     )
     temp_to_target.operation = 'SUBTRACT'
     _link(links, target_pos_socket, temp_to_target.inputs[0])
-    _link(links, sim_in.outputs['Position'], temp_to_target.inputs[1])
+    _link(links, spawn_pos_socket, temp_to_target.inputs[1])
 
     temp_dist = _add_node(
         nodes, 'ShaderNodeVectorMath',
@@ -910,7 +935,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
 
     repulsor_force_socket = _build_repulsor_forces(
         nodes, links,
-        position_socket=sim_in.outputs['Position'],
+        position_socket=spawn_pos_socket,
         target_pos_socket=target_pos_socket,
         dist_to_target_socket=temp_dist.outputs['Value'],
         repulsor_info_nodes=rep_infos,
@@ -923,7 +948,7 @@ def build_torpedo_effect(launchpads, targets, repulsors):
     vel_socket, pos_socket, dist_socket = _build_velocity_integration(
         nodes, links,
         velocity_socket=initial_vel_socket,
-        position_socket=sim_in.outputs['Position'],
+        position_socket=spawn_pos_socket,
         target_pos_socket=target_pos_socket,
         attraction_socket=sim_in.outputs['AttrParam'],
         repulsor_force_socket=repulsor_force_socket,
