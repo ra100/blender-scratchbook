@@ -108,6 +108,26 @@ Tunable on the modifier panel of `TorpedoController`:
 | `Arrival Distance`          | 25      | Snap to target when within this                  |
 | `Torpedo Radius`            | 10      | Visual sphere radius                              |
 | `Coast Frames`              | 3       | Frames of straight flight after launch            |
+| `Debug Trails`              | false   | Draw each torpedo's trajectory as a thin tube     |
+| `Trail Radius`              | 1.5     | Thickness of trail tubes                          |
+
+### Debug trails
+
+Toggle `Debug Trails` on the modifier to draw each torpedo's flight path as
+a thin tube grouped by launch order. Useful for:
+
+- Verifying repulsor detour shapes
+- Spotting torpedoes that orbit or miss targets
+- Comparing `Max Turn Rate` / `Steering Range` tuning visually
+
+Mechanics: a `Trail` geometry state item in the Simulation Zone accumulates
+one vertex per active torpedo every frame, tagged with `torpedo_id` =
+point index. Post-sim, `Mesh to Points → Points to Curves` grouped by id
+builds one curve per torpedo; `Curve to Mesh` with a circle profile of
+`Trail Radius` makes the tube. A `Switch` node gates rendering on
+`Debug Trails`.
+
+Trails reset when the simulation resets (scrub to frame 1).
 
 ## Tuning guide
 

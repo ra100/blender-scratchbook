@@ -1328,6 +1328,8 @@ def build_torpedo_effect():
         ("Arrival Distance",       'NodeSocketFloat', 25.0),
         ("Torpedo Radius",         'NodeSocketFloat', 10.0),
         ("Coast Frames",           'NodeSocketFloat', 3.0),
+        ("Debug Trails",           'NodeSocketBool',  False),
+        ("Trail Radius",           'NodeSocketFloat', 1.5),
     ]
     for name, sock_type, default in param_defs:
         sock = ng.interface.new_socket(name, in_out='INPUT', socket_type=sock_type)
@@ -1349,6 +1351,7 @@ def build_torpedo_effect():
     sim_out.state_items.new('FLOAT', "Age")
     sim_out.state_items.new('FLOAT', "TargetIdx")       # -1 until launch, then rank
     sim_out.state_items.new('FLOAT', "PrevLpScale")     # per-slot previous LP scale length (for rising edge)
+    sim_out.state_items.new('GEOMETRY', "Trail")        # accumulated trajectory points
 
     # Pass-through parameter state items (GroupInput → sim zone workaround)
     param_state_names = [
@@ -1685,6 +1688,73 @@ def build_torpedo_effect():
         x_offset=7600,
     )
 
+    # --- Trail accumulation inside sim zone ---
+    # Each frame: take this-frame torpedo points, position them at final_pos,
+    # keep only active & !arrived, tag each with torpedo_id = point_index,
+    # join with prior-frame Trail state. Output to sim_out.Trail.
+    tx = 6200
+
+    # Build a fresh points mesh for this frame — one vertex per torpedo slot.
+    trail_base = _add_node(
+        nodes, 'GeometryNodeMeshLine', "TrailBase", (tx, -1600),
+    )
+    _link(links, total_slots.outputs[0], trail_base.inputs['Count'])
+
+    # Set per-point position = final_pos (torpedo's new position this frame).
+    trail_set_pos = _add_node(
+        nodes, 'GeometryNodeSetPosition', "TrailSetPos", (tx + 200, -1600),
+    )
+    _link(links, trail_base.outputs['Mesh'], trail_set_pos.inputs['Geometry'])
+    _link(links, final_pos_socket, trail_set_pos.inputs['Position'])
+
+    # Store torpedo_id attribute (= point_index, cast to int for Points to Curves).
+    trail_idx_in = _add_node(
+        nodes, 'GeometryNodeInputIndex', "TrailIdxIn", (tx + 200, -1800),
+    )
+    trail_store_id = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "TrailStoreId", (tx + 400, -1600),
+    )
+    trail_store_id.data_type = 'INT'
+    trail_store_id.domain = 'POINT'
+    trail_store_id.inputs['Name'].default_value = "torpedo_id"
+    _link(links, trail_set_pos.outputs['Geometry'], trail_store_id.inputs['Geometry'])
+    _link(links, trail_idx_in.outputs['Index'], trail_store_id.inputs['Value'])
+
+    # Drop points that are inactive or arrived.
+    # keep = active * (1 - arrived)
+    trail_one_minus_arr = _add_math_node(
+        nodes, 'SUBTRACT', "TrailOneMinusArr", (tx + 300, -1900),
+    )
+    trail_one_minus_arr.inputs[0].default_value = 1.0
+    _link(links, arrived_socket, trail_one_minus_arr.inputs[1])
+
+    trail_keep = _add_math_node(
+        nodes, 'MULTIPLY', "TrailKeep", (tx + 500, -1900),
+    )
+    _link(links, active_socket, trail_keep.inputs[0])
+    _link(links, trail_one_minus_arr.outputs[0], trail_keep.inputs[1])
+
+    # Invert for deletion (delete points where keep < 0.5).
+    trail_drop = _add_math_node(
+        nodes, 'LESS_THAN', "TrailDrop", (tx + 700, -1900),
+    )
+    trail_drop.inputs[1].default_value = 0.5
+    _link(links, trail_keep.outputs[0], trail_drop.inputs[0])
+
+    trail_delete = _add_node(
+        nodes, 'GeometryNodeDeleteGeometry', "TrailDelete", (tx + 700, -1600),
+    )
+    trail_delete.domain = 'POINT'
+    _link(links, trail_store_id.outputs['Geometry'], trail_delete.inputs['Geometry'])
+    _link(links, trail_drop.outputs[0], trail_delete.inputs['Selection'])
+
+    # Join new points with prior Trail state.
+    trail_join = _add_node(
+        nodes, 'GeometryNodeJoinGeometry', "TrailJoin", (tx + 900, -1600),
+    )
+    _link(links, sim_in.outputs['Trail'], trail_join.inputs['Geometry'])
+    _link(links, trail_delete.outputs['Geometry'], trail_join.inputs['Geometry'])
+
     # --- Wire to Sim Zone output ---
     _link(links, final_pos_socket, sim_out.inputs['Position'])
     _link(links, final_vel_socket, sim_out.inputs['Velocity'])
@@ -1693,10 +1763,11 @@ def build_torpedo_effect():
     _link(links, new_age.outputs[0], sim_out.inputs['Age'])
     _link(links, target_idx_socket.outputs[0], sim_out.inputs['TargetIdx'])
     _link(links, lp_scale_len_cur.outputs['Value'], sim_out.inputs['PrevLpScale'])
+    _link(links, trail_join.outputs['Geometry'], sim_out.inputs['Trail'])
 
     # --- Post-sim visual output ---
     mat = _create_torpedo_material()
-    final_geo = _build_visual_output(
+    visual_geo = _build_visual_output(
         nodes, links,
         geo_socket=sim_out.outputs['Geometry'],
         position_socket=sim_out.outputs['Position'],
@@ -1707,9 +1778,69 @@ def build_torpedo_effect():
         x_offset=7400,
     )
 
-    _link(links, final_geo, group_out.inputs['Geometry'])
+    # --- Post-sim trail rendering (gated by Debug Trails) ---
+    # Points to Curves groups by torpedo_id → each torpedo gets its own curve.
+    # Curve to Mesh with circle profile = tube. Join with visual.
+    dx = 8000
 
-    print("  Built TorpedoEffect v2 (slerp + tangent-steering + brake-cap + approach-corridor).")
+    trail_id_in = _add_node(
+        nodes, 'GeometryNodeInputNamedAttribute', "TrailIdInRead", (dx, -1800),
+    )
+    trail_id_in.data_type = 'INT'
+    trail_id_in.inputs['Name'].default_value = "torpedo_id"
+
+    # Convert trail mesh verts to points cloud (PointsToCurves needs POINTS geo).
+    mesh_to_pts = _add_node(
+        nodes, 'GeometryNodeMeshToPoints', "TrailMeshToPts", (dx, -1600),
+    )
+    mesh_to_pts.mode = 'VERTICES'
+    _link(links, sim_out.outputs['Trail'], mesh_to_pts.inputs['Mesh'])
+
+    pts_to_curves = _add_node(
+        nodes, 'GeometryNodePointsToCurves', "TrailPointsToCurves", (dx + 200, -1600),
+    )
+    _link(links, mesh_to_pts.outputs['Points'], pts_to_curves.inputs['Points'])
+    _link(links, trail_id_in.outputs['Attribute'], pts_to_curves.inputs['Curve Group ID'])
+
+    circle = _add_node(
+        nodes, 'GeometryNodeCurvePrimitiveCircle', "TrailCircle", (dx, -1400),
+    )
+    circle.mode = 'RADIUS'
+    circle.inputs['Resolution'].default_value = 6
+    _link(links, group_in.outputs['Trail Radius'], circle.inputs['Radius'])
+
+    curve_to_mesh = _add_node(
+        nodes, 'GeometryNodeCurveToMesh', "TrailCurveToMesh", (dx + 400, -1600),
+    )
+    _link(links, pts_to_curves.outputs['Curves'], curve_to_mesh.inputs['Curve'])
+    _link(links, circle.outputs['Curve'], curve_to_mesh.inputs['Profile Curve'])
+
+    # Material for trails (reuse torpedo emission — looks right).
+    trail_set_mat = _add_node(
+        nodes, 'GeometryNodeSetMaterial', "TrailSetMat", (dx + 600, -1600),
+    )
+    trail_set_mat.inputs['Material'].default_value = mat
+    _link(links, curve_to_mesh.outputs['Mesh'], trail_set_mat.inputs['Geometry'])
+
+    # Join visual + trail
+    visual_plus_trail = _add_node(
+        nodes, 'GeometryNodeJoinGeometry', "VisualPlusTrail", (dx + 800, -1400),
+    )
+    _link(links, visual_geo, visual_plus_trail.inputs['Geometry'])
+    _link(links, trail_set_mat.outputs['Geometry'], visual_plus_trail.inputs['Geometry'])
+
+    # Switch: Debug Trails = True → visual+trail, False → visual only
+    debug_switch = _add_node(
+        nodes, 'GeometryNodeSwitch', "DebugTrailSwitch", (dx + 1000, -1400),
+    )
+    debug_switch.input_type = 'GEOMETRY'
+    _link(links, group_in.outputs['Debug Trails'], debug_switch.inputs['Switch'])
+    _link(links, visual_geo, debug_switch.inputs['False'])
+    _link(links, visual_plus_trail.outputs['Geometry'], debug_switch.inputs['True'])
+
+    _link(links, debug_switch.outputs['Output'], group_out.inputs['Geometry'])
+
+    print("  Built TorpedoEffect v2 (slerp + tangent-steering + brake-cap + approach-corridor + trails).")
     return ng
 
 
