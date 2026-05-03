@@ -1694,18 +1694,14 @@ def build_torpedo_effect():
     # join with prior-frame Trail state. Output to sim_out.Trail.
     tx = 6200
 
-    # Build a fresh point cloud for this frame — one point per torpedo slot.
-    # Use Mesh Line → Mesh to Points so Join Geometry accumulates POINTCLOUD
-    # (not MESH with loose verts — Points to Curves won't read those).
-    trail_base = _add_node(
-        nodes, 'GeometryNodeMeshLine', "TrailBase", (tx, -1600),
-    )
-    _link(links, total_slots.outputs[0], trail_base.inputs['Count'])
-
+    # Use the sim zone's own mesh as the source so per-point fields like
+    # `final_pos_socket` evaluate in the correct context. Set Position on
+    # a FRESH Mesh Line would resolve `Input Position` inside final_pos_socket
+    # against that fresh mesh (all zeros) — producing a trail stuck at origin.
     trail_set_pos = _add_node(
         nodes, 'GeometryNodeSetPosition', "TrailSetPos", (tx + 200, -1600),
     )
-    _link(links, trail_base.outputs['Mesh'], trail_set_pos.inputs['Geometry'])
+    _link(links, sim_in.outputs['Geometry'], trail_set_pos.inputs['Geometry'])
     _link(links, final_pos_socket, trail_set_pos.inputs['Position'])
 
     # Convert mesh verts → point cloud BEFORE storing attrs, so Join Geometry
@@ -1716,16 +1712,30 @@ def build_torpedo_effect():
     trail_to_points.mode = 'VERTICES'
     _link(links, trail_set_pos.outputs['Geometry'], trail_to_points.inputs['Mesh'])
 
+    # Store temporal weight (scene frame) so PointsToCurves orders points
+    # within each torpedo group by time — otherwise curves can scramble.
+    trail_scene_time = _add_node(
+        nodes, 'GeometryNodeInputSceneTime', "TrailSceneTime", (tx + 300, -2000),
+    )
+    trail_store_t = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "TrailStoreT", (tx + 420, -1600),
+    )
+    trail_store_t.data_type = 'FLOAT'
+    trail_store_t.domain = 'POINT'
+    trail_store_t.inputs['Name'].default_value = "trail_t"
+    _link(links, trail_to_points.outputs['Points'], trail_store_t.inputs['Geometry'])
+    _link(links, trail_scene_time.outputs['Frame'], trail_store_t.inputs['Value'])
+
     trail_idx_in = _add_node(
         nodes, 'GeometryNodeInputIndex', "TrailIdxIn", (tx + 300, -1800),
     )
     trail_store_id = _add_node(
-        nodes, 'GeometryNodeStoreNamedAttribute', "TrailStoreId", (tx + 500, -1600),
+        nodes, 'GeometryNodeStoreNamedAttribute', "TrailStoreId", (tx + 540, -1600),
     )
     trail_store_id.data_type = 'INT'
     trail_store_id.domain = 'POINT'
     trail_store_id.inputs['Name'].default_value = "torpedo_id"
-    _link(links, trail_to_points.outputs['Points'], trail_store_id.inputs['Geometry'])
+    _link(links, trail_store_t.outputs['Geometry'], trail_store_id.inputs['Geometry'])
     _link(links, trail_idx_in.outputs['Index'], trail_store_id.inputs['Value'])
 
     # keep = active * (1 - arrived)
@@ -1796,11 +1806,18 @@ def build_torpedo_effect():
     trail_id_in.inputs['Name'].default_value = "torpedo_id"
 
     # Trail is already POINTCLOUD (converted inside sim zone before Join).
+    trail_t_in = _add_node(
+        nodes, 'GeometryNodeInputNamedAttribute', "TrailTInRead", (dx, -1950),
+    )
+    trail_t_in.data_type = 'FLOAT'
+    trail_t_in.inputs['Name'].default_value = "trail_t"
+
     pts_to_curves = _add_node(
         nodes, 'GeometryNodePointsToCurves', "TrailPointsToCurves", (dx + 200, -1600),
     )
     _link(links, sim_out.outputs['Trail'], pts_to_curves.inputs['Points'])
     _link(links, trail_id_in.outputs['Attribute'], pts_to_curves.inputs['Curve Group ID'])
+    _link(links, trail_t_in.outputs['Attribute'], pts_to_curves.inputs['Weight'])
 
     circle = _add_node(
         nodes, 'GeometryNodeCurvePrimitiveCircle', "TrailCircle", (dx, -1400),
