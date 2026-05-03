@@ -388,7 +388,8 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
                            target_pos_socket, dist_to_target_socket,
                            rep_instances_socket, rep_count_socket,
                            rep_strength_socket, rep_radius_socket,
-                           safety_margin_socket, brake_gain_socket,
+                           safety_margin_socket, steering_range_socket,
+                           brake_gain_socket,
                            approach_radius_socket, x_offset):
     """Tangent-steering + brake-cap repulsor avoidance via Repeat Zone.
 
@@ -478,14 +479,33 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
     brake_approaching.inputs[1].default_value = 0.3
     _link(links, approach.outputs['Value'], brake_approaching.inputs[0])
 
-    # safe = envelope + safety_margin
+    # safe = envelope + safety_margin  (brake + min-pass margin)
     safe_dist = _add_math_node(nodes, 'ADD', "SafeDist", (x + 800, y + 200))
     _link(links, rep_radius_socket, safe_dist.inputs[0])
     _link(links, safety_margin_socket, safe_dist.inputs[1])
 
-    in_range = _add_math_node(nodes, 'LESS_THAN', "InRange", (x + 1000, y + 100))
-    _link(links, dist_rep.outputs['Value'], in_range.inputs[0])
-    _link(links, safe_dist.outputs[0], in_range.inputs[1])
+    # steer_outer = safe + steering_range  (where steering starts engaging)
+    steer_outer = _add_math_node(nodes, 'ADD', "SteerOuter", (x + 800, y + 260))
+    _link(links, safe_dist.outputs[0], steer_outer.inputs[0])
+    _link(links, steering_range_socket, steer_outer.inputs[1])
+
+    # steering engages when dist < steer_outer
+    in_steer_range = _add_math_node(
+        nodes, 'LESS_THAN', "InSteerRange", (x + 1000, y + 100),
+    )
+    _link(links, dist_rep.outputs['Value'], in_steer_range.inputs[0])
+    _link(links, steer_outer.outputs[0], in_steer_range.inputs[1])
+
+    # brake engages when dist < safe (tighter)
+    in_brake_range = _add_math_node(
+        nodes, 'LESS_THAN', "InBrakeRange", (x + 1000, y + 40),
+    )
+    _link(links, dist_rep.outputs['Value'], in_brake_range.inputs[0])
+    _link(links, safe_dist.outputs[0], in_brake_range.inputs[1])
+
+    # Keep old "in_range" name pointing to steer (steering is the dominant
+    # effect now). Brake path will use in_brake_range.
+    in_range = in_steer_range
 
     # rep_gate: rep not in approach corridor of target (either rep is far from target
     # OR torpedo still far from target)
@@ -560,22 +580,37 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
     tan_norm = _safe_normalize(nodes, links, tan_pick.outputs[1],
                                "TanNorm", (x + 1800, y + 350))
 
-    # blend = saturate((safe - dist) / safety_margin)
-    safe_minus_dist = _add_math_node(nodes, 'SUBTRACT', "SafeMinusDist", (x + 1200, y + 100))
-    _link(links, safe_dist.outputs[0], safe_minus_dist.inputs[0])
-    _link(links, dist_rep.outputs['Value'], safe_minus_dist.inputs[1])
+    # blend ramp: 0 at dist=steer_outer, 1 at dist=envelope.
+    # blend_linear = saturate((steer_outer - dist) / (steer_outer - envelope))
+    # Then squared for softer start / stronger near envelope.
+    outer_minus_dist = _add_math_node(
+        nodes, 'SUBTRACT', "OuterMinusDist", (x + 1200, y + 100),
+    )
+    _link(links, steer_outer.outputs[0], outer_minus_dist.inputs[0])
+    _link(links, dist_rep.outputs['Value'], outer_minus_dist.inputs[1])
+
+    steer_span = _add_math_node(
+        nodes, 'SUBTRACT', "SteerSpan", (x + 1200, y + 30),
+    )
+    _link(links, steer_outer.outputs[0], steer_span.inputs[0])
+    _link(links, rep_radius_socket, steer_span.inputs[1])
 
     blend_raw = _add_math_node(nodes, 'DIVIDE', "BlendRaw", (x + 1400, y + 100))
-    _link(links, safe_minus_dist.outputs[0], blend_raw.inputs[0])
-    _link(links, safety_margin_socket, blend_raw.inputs[1])
+    _link(links, outer_minus_dist.outputs[0], blend_raw.inputs[0])
+    _link(links, steer_span.outputs[0], blend_raw.inputs[1])
 
     blend_lo = _add_math_node(nodes, 'MAXIMUM', "BlendLo", (x + 1600, y + 100))
     blend_lo.inputs[1].default_value = 0.0
     _link(links, blend_raw.outputs[0], blend_lo.inputs[0])
 
-    blend = _add_math_node(nodes, 'MINIMUM', "Blend", (x + 1700, y + 100))
-    blend.inputs[1].default_value = 1.0
-    _link(links, blend_lo.outputs[0], blend.inputs[0])
+    blend_linear = _add_math_node(nodes, 'MINIMUM', "BlendLinear", (x + 1650, y + 80))
+    blend_linear.inputs[1].default_value = 1.0
+    _link(links, blend_lo.outputs[0], blend_linear.inputs[0])
+
+    # blend = blend_linear^2 → softer engagement at outer edge, stronger near envelope
+    blend = _add_math_node(nodes, 'MULTIPLY', "Blend", (x + 1700, y + 100))
+    _link(links, blend_linear.outputs[0], blend.inputs[0])
+    _link(links, blend_linear.outputs[0], blend.inputs[1])
 
     # weight = active * blend * rep_strength / max(dist, 1)
     dist_safe = _add_math_node(nodes, 'MAXIMUM', "DistSafe", (x + 1600, y - 100))
@@ -623,12 +658,13 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
     _link(links, brake_gain_socket, brake_raw.inputs[1])
 
     # brake_cap_i = brake_fully_active ? brake_raw : SENTINEL
-    # brake_fully_active = brake_approaching * in_range * rep_gate
+    # brake_fully_active = brake_approaching * in_brake_range * rep_gate
+    # Tighter range than steering so brake only engages when close.
     brake_ab = _add_math_node(
         nodes, 'MULTIPLY', "BrakeAB", (x + 1400, y - 350),
     )
     _link(links, brake_approaching.outputs[0], brake_ab.inputs[0])
-    _link(links, in_range.outputs[0], brake_ab.inputs[1])
+    _link(links, in_brake_range.outputs[0], brake_ab.inputs[1])
 
     brake_full = _add_math_node(
         nodes, 'MULTIPLY', "BrakeFull", (x + 1500, y - 400),
@@ -1110,9 +1146,10 @@ def build_torpedo_effect():
         ("Exit Velocity",          'NodeSocketFloat', 400.0),
         ("Attraction",             'NodeSocketFloat', 1.0),
         ("Max Speed",              'NodeSocketFloat', 400.0),   # ~16 u/frame @ 24fps
-        ("Repulsor Strength",      'NodeSocketFloat', 600.0),   # stronger steering
+        ("Repulsor Strength",      'NodeSocketFloat', 1200.0),  # strong steering (blend² compensated)
         ("Repulsor Radius",        'NodeSocketFloat', 80.0),    # tighter envelope
-        ("Repulsor Safety Margin", 'NodeSocketFloat', 60.0),
+        ("Repulsor Safety Margin", 'NodeSocketFloat', 40.0),    # tight miss margin
+        ("Repulsor Steering Range",'NodeSocketFloat', 200.0),   # early-engage radius
         ("Repulsor Brake Gain",    'NodeSocketFloat', 8.0),
         ("Approach Radius",        'NodeSocketFloat', 50.0),
         ("Max Turn Rate",          'NodeSocketFloat', pi * 2),  # 2π rad/s — fast turn
@@ -1144,7 +1181,8 @@ def build_torpedo_effect():
     # Pass-through parameter state items (GroupInput → sim zone workaround)
     param_state_names = [
         "ExitVelParam", "AttrParam", "MaxSpeedParam",
-        "RepStrParam", "RepRadParam", "SafeMarginParam", "BrakeGainParam",
+        "RepStrParam", "RepRadParam", "SafeMarginParam",
+        "SteerRangeParam", "BrakeGainParam",
         "ApproachRadParam", "MaxTurnParam", "ArrDistParam", "CoastParam",
     ]
     for name in param_state_names:
@@ -1182,8 +1220,9 @@ def build_torpedo_effect():
         ("Max Speed",              "MaxSpeedParam"),
         ("Repulsor Strength",      "RepStrParam"),
         ("Repulsor Radius",        "RepRadParam"),
-        ("Repulsor Safety Margin", "SafeMarginParam"),
-        ("Repulsor Brake Gain",    "BrakeGainParam"),
+        ("Repulsor Safety Margin",  "SafeMarginParam"),
+        ("Repulsor Steering Range", "SteerRangeParam"),
+        ("Repulsor Brake Gain",     "BrakeGainParam"),
         ("Approach Radius",        "ApproachRadParam"),
         ("Max Turn Rate",          "MaxTurnParam"),
         ("Arrival Distance",       "ArrDistParam"),
@@ -1402,6 +1441,7 @@ def build_torpedo_effect():
         rep_strength_socket=sim_in.outputs['RepStrParam'],
         rep_radius_socket=sim_in.outputs['RepRadParam'],
         safety_margin_socket=sim_in.outputs['SafeMarginParam'],
+        steering_range_socket=sim_in.outputs['SteerRangeParam'],
         brake_gain_socket=sim_in.outputs['BrakeGainParam'],
         approach_radius_socket=sim_in.outputs['ApproachRadParam'],
         x_offset=1000,
