@@ -1694,63 +1694,69 @@ def build_torpedo_effect():
     # join with prior-frame Trail state. Output to sim_out.Trail.
     tx = 6200
 
-    # Build a fresh points mesh for this frame — one vertex per torpedo slot.
+    # Build a fresh point cloud for this frame — one point per torpedo slot.
+    # Use Mesh Line → Mesh to Points so Join Geometry accumulates POINTCLOUD
+    # (not MESH with loose verts — Points to Curves won't read those).
     trail_base = _add_node(
         nodes, 'GeometryNodeMeshLine', "TrailBase", (tx, -1600),
     )
     _link(links, total_slots.outputs[0], trail_base.inputs['Count'])
 
-    # Set per-point position = final_pos (torpedo's new position this frame).
     trail_set_pos = _add_node(
         nodes, 'GeometryNodeSetPosition', "TrailSetPos", (tx + 200, -1600),
     )
     _link(links, trail_base.outputs['Mesh'], trail_set_pos.inputs['Geometry'])
     _link(links, final_pos_socket, trail_set_pos.inputs['Position'])
 
-    # Store torpedo_id attribute (= point_index, cast to int for Points to Curves).
+    # Convert mesh verts → point cloud BEFORE storing attrs, so Join Geometry
+    # accumulates POINTCLOUD type that Points to Curves accepts post-sim.
+    trail_to_points = _add_node(
+        nodes, 'GeometryNodeMeshToPoints', "TrailMeshToPts_Local", (tx + 350, -1600),
+    )
+    trail_to_points.mode = 'VERTICES'
+    _link(links, trail_set_pos.outputs['Geometry'], trail_to_points.inputs['Mesh'])
+
     trail_idx_in = _add_node(
-        nodes, 'GeometryNodeInputIndex', "TrailIdxIn", (tx + 200, -1800),
+        nodes, 'GeometryNodeInputIndex', "TrailIdxIn", (tx + 300, -1800),
     )
     trail_store_id = _add_node(
-        nodes, 'GeometryNodeStoreNamedAttribute', "TrailStoreId", (tx + 400, -1600),
+        nodes, 'GeometryNodeStoreNamedAttribute', "TrailStoreId", (tx + 500, -1600),
     )
     trail_store_id.data_type = 'INT'
     trail_store_id.domain = 'POINT'
     trail_store_id.inputs['Name'].default_value = "torpedo_id"
-    _link(links, trail_set_pos.outputs['Geometry'], trail_store_id.inputs['Geometry'])
+    _link(links, trail_to_points.outputs['Points'], trail_store_id.inputs['Geometry'])
     _link(links, trail_idx_in.outputs['Index'], trail_store_id.inputs['Value'])
 
-    # Drop points that are inactive or arrived.
     # keep = active * (1 - arrived)
     trail_one_minus_arr = _add_math_node(
-        nodes, 'SUBTRACT', "TrailOneMinusArr", (tx + 300, -1900),
+        nodes, 'SUBTRACT', "TrailOneMinusArr", (tx + 400, -1900),
     )
     trail_one_minus_arr.inputs[0].default_value = 1.0
     _link(links, arrived_socket, trail_one_minus_arr.inputs[1])
 
     trail_keep = _add_math_node(
-        nodes, 'MULTIPLY', "TrailKeep", (tx + 500, -1900),
+        nodes, 'MULTIPLY', "TrailKeep", (tx + 600, -1900),
     )
     _link(links, active_socket, trail_keep.inputs[0])
     _link(links, trail_one_minus_arr.outputs[0], trail_keep.inputs[1])
 
-    # Invert for deletion (delete points where keep < 0.5).
     trail_drop = _add_math_node(
-        nodes, 'LESS_THAN', "TrailDrop", (tx + 700, -1900),
+        nodes, 'LESS_THAN', "TrailDrop", (tx + 800, -1900),
     )
     trail_drop.inputs[1].default_value = 0.5
     _link(links, trail_keep.outputs[0], trail_drop.inputs[0])
 
     trail_delete = _add_node(
-        nodes, 'GeometryNodeDeleteGeometry', "TrailDelete", (tx + 700, -1600),
+        nodes, 'GeometryNodeDeleteGeometry', "TrailDelete", (tx + 800, -1600),
     )
     trail_delete.domain = 'POINT'
     _link(links, trail_store_id.outputs['Geometry'], trail_delete.inputs['Geometry'])
     _link(links, trail_drop.outputs[0], trail_delete.inputs['Selection'])
 
-    # Join new points with prior Trail state.
+    # Join new points with prior Trail state (both POINTCLOUD).
     trail_join = _add_node(
-        nodes, 'GeometryNodeJoinGeometry', "TrailJoin", (tx + 900, -1600),
+        nodes, 'GeometryNodeJoinGeometry', "TrailJoin", (tx + 1000, -1600),
     )
     _link(links, sim_in.outputs['Trail'], trail_join.inputs['Geometry'])
     _link(links, trail_delete.outputs['Geometry'], trail_join.inputs['Geometry'])
@@ -1789,17 +1795,11 @@ def build_torpedo_effect():
     trail_id_in.data_type = 'INT'
     trail_id_in.inputs['Name'].default_value = "torpedo_id"
 
-    # Convert trail mesh verts to points cloud (PointsToCurves needs POINTS geo).
-    mesh_to_pts = _add_node(
-        nodes, 'GeometryNodeMeshToPoints', "TrailMeshToPts", (dx, -1600),
-    )
-    mesh_to_pts.mode = 'VERTICES'
-    _link(links, sim_out.outputs['Trail'], mesh_to_pts.inputs['Mesh'])
-
+    # Trail is already POINTCLOUD (converted inside sim zone before Join).
     pts_to_curves = _add_node(
         nodes, 'GeometryNodePointsToCurves', "TrailPointsToCurves", (dx + 200, -1600),
     )
-    _link(links, mesh_to_pts.outputs['Points'], pts_to_curves.inputs['Points'])
+    _link(links, sim_out.outputs['Trail'], pts_to_curves.inputs['Points'])
     _link(links, trail_id_in.outputs['Attribute'], pts_to_curves.inputs['Curve Group ID'])
 
     circle = _add_node(
