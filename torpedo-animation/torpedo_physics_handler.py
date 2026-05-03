@@ -34,6 +34,7 @@ from mathutils import Vector
 # ============================================================
 
 NODE_GROUP_NAME = "TorpedoEffect"
+REPULSOR_TAG_NAME = "RepulsorTag"
 LAUNCHPAD_COLLECTION = "Launchpads"
 TARGET_COLLECTION = "Targets"
 REPULSOR_COLLECTION = "Repulsors"
@@ -384,35 +385,120 @@ def _build_launch(nodes, links, lp_scale_socket, lp_rot_socket, lp_pos_socket,
             lp_hot.outputs[0], rising_edge.outputs[0])
 
 
+def build_repulsor_tag_nodegroup():
+    """Tiny per-rep node group. Added as a modifier on each repulsor object.
+
+    Output geometry = input visual mesh (joined with) a 1-vertex 'marker point'
+    at origin carrying these POINT attributes:
+      - rep_marker : 1.0 on the marker vertex, 0.0 on visual verts
+      - torpedo_min / torpedo_max : index range this rep affects (inclusive)
+      - rep_radius : envelope radius (hard shell)
+
+    Main tree realizes the Repulsors collection, filters to rep_marker=1.0
+    verts, then iterates per marker — 1 vertex per rep, positioned at the
+    rep object's origin.
+    """
+    old = bpy.data.node_groups.get(REPULSOR_TAG_NAME)
+    if old:
+        bpy.data.node_groups.remove(old)
+    ng = bpy.data.node_groups.new(REPULSOR_TAG_NAME, 'GeometryNodeTree')
+    ng.is_modifier = True
+
+    ng.interface.new_socket('Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')
+    ng.interface.new_socket('Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    for name, default in (("Min Index", 0.0),
+                          ("Max Index", 9999.0),
+                          ("Radius", 80.0)):
+        s = ng.interface.new_socket(name, in_out='INPUT', socket_type='NodeSocketFloat')
+        s.default_value = default
+
+    nodes = ng.nodes
+    links = ng.links
+    gi = _add_node(nodes, 'NodeGroupInput', "GI", (-800, 0))
+    go = _add_node(nodes, 'NodeGroupOutput', "GO", (1200, 0))
+
+    # Visual pass: tag input mesh verts with rep_marker = 0
+    visual_mark = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "VisualMark", (-500, 100),
+    )
+    visual_mark.data_type = 'FLOAT'
+    visual_mark.domain = 'POINT'
+    visual_mark.inputs['Name'].default_value = "rep_marker"
+    visual_mark.inputs['Value'].default_value = 0.0
+    _link(links, gi.outputs['Geometry'], visual_mark.inputs['Geometry'])
+
+    # Marker point: single vertex at origin
+    marker_pt = _add_node(
+        nodes, 'GeometryNodeMeshLine', "MarkerPt", (-500, -200),
+    )
+    marker_pt.inputs['Count'].default_value = 1
+
+    # Tag marker with rep_marker = 1, plus torpedo_min/max/rep_radius
+    mark_one = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "MarkOne", (-300, -200),
+    )
+    mark_one.data_type = 'FLOAT'
+    mark_one.domain = 'POINT'
+    mark_one.inputs['Name'].default_value = "rep_marker"
+    mark_one.inputs['Value'].default_value = 1.0
+    _link(links, marker_pt.outputs['Mesh'], mark_one.inputs['Geometry'])
+
+    mark_min = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "MarkMin", (-100, -200),
+    )
+    mark_min.data_type = 'FLOAT'
+    mark_min.domain = 'POINT'
+    mark_min.inputs['Name'].default_value = "torpedo_min"
+    _link(links, mark_one.outputs['Geometry'], mark_min.inputs['Geometry'])
+    _link(links, gi.outputs['Min Index'], mark_min.inputs['Value'])
+
+    mark_max = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "MarkMax", (100, -200),
+    )
+    mark_max.data_type = 'FLOAT'
+    mark_max.domain = 'POINT'
+    mark_max.inputs['Name'].default_value = "torpedo_max"
+    _link(links, mark_min.outputs['Geometry'], mark_max.inputs['Geometry'])
+    _link(links, gi.outputs['Max Index'], mark_max.inputs['Value'])
+
+    mark_rad = _add_node(
+        nodes, 'GeometryNodeStoreNamedAttribute', "MarkRad", (300, -200),
+    )
+    mark_rad.data_type = 'FLOAT'
+    mark_rad.domain = 'POINT'
+    mark_rad.inputs['Name'].default_value = "rep_radius"
+    _link(links, mark_max.outputs['Geometry'], mark_rad.inputs['Geometry'])
+    _link(links, gi.outputs['Radius'], mark_rad.inputs['Value'])
+
+    # Join visual mesh + marker point
+    join = _add_node(nodes, 'GeometryNodeJoinGeometry', "Join", (600, 0))
+    _link(links, visual_mark.outputs['Geometry'], join.inputs['Geometry'])
+    _link(links, mark_rad.outputs['Geometry'], join.inputs['Geometry'])
+
+    _link(links, join.outputs['Geometry'], go.inputs['Geometry'])
+
+    print(f"  Built {REPULSOR_TAG_NAME} node group.")
+    return ng
+
+
 def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
                            target_pos_socket, dist_to_target_socket,
-                           rep_instances_socket, rep_count_socket,
-                           rep_strength_socket, rep_radius_socket,
+                           rep_markers_socket, rep_count_socket,
+                           torpedo_idx_socket,
+                           rep_strength_socket,
                            safety_margin_socket, steering_range_socket,
                            brake_gain_socket,
                            approach_radius_socket, x_offset):
-    """Tangent-steering + brake-cap repulsor avoidance via Repeat Zone.
+    """Per-rep tangent-steering + brake-cap with per-rep attributes.
 
-    For each repulsor i:
-      to_rep    = rep_pos - pos
-      dist      = |to_rep|
-      envelope  = rep_radius
-      safe      = envelope + safety_margin
-      approach  = dot(vel_dir, to_rep_norm)            # >0 = heading toward rep
-      rep_gate  = (dist_rep_target > approach_radius) OR (dist_to_target > approach_radius)
-      active    = approach > 0 AND dist < safe AND rep_gate
+    rep_markers_socket: 1 vertex per repulsor, with POINT attributes
+      - torpedo_min, torpedo_max : index range this rep affects (inclusive)
+      - rep_radius : envelope radius
 
-      tangent   = vel - dot(vel, to_rep_norm) * to_rep_norm
-                  (fallback to cross(to_rep_norm, +Z) if vel || to_rep)
-      blend     = saturate((safe - dist) / safety_margin)
-      weight    = active * blend * rep_strength / max(dist, 1)
-      steering += normalize(tangent) * weight
+    Gate:
+      affects = (torpedo_idx >= torpedo_min) AND (torpedo_idx <= torpedo_max)
 
-      brake_cap_i = active ? max(0, dist - envelope) * brake_gain : INF
-      brake_cap   = min_i(brake_cap_i)
-
-    Empty collection → zero iterations → steering = (0,0,0), brake_cap = INF.
-
+    Multiplied into both steering and brake gates.
     Returns (steering_dir_socket, brake_cap_socket).
     """
     x = x_offset
@@ -436,14 +522,90 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
     _link(links, dummy.outputs['Mesh'], ri.inputs['Geometry'])
     _link(links, ri.outputs['Geometry'], ro.inputs['Geometry'])
 
-    # Per-iter repulsor position
+    # Per-iter rep: sample the i-th marker vertex for position + attributes.
     rep_pos_in = _add_node(nodes, 'GeometryNodeInputPosition',
                            "RepPosIn", (x + 200, y - 400))
-    rep_pos = _sample_per_point(
-        nodes, links, rep_instances_socket, ri.outputs['Iteration'],
-        rep_pos_in.outputs['Position'], 'FLOAT_VECTOR',
-        "SampleRepPos", (x + 400, y - 400),
+
+    # Capture per-rep attributes onto the marker geometry explicitly.
+    # Using Input Named Attribute directly inside Sample Index can yield stale
+    # evaluations in some Blender versions — Capture Attribute binds the named
+    # attribute as an anonymous field tied to this geometry, then Sample Index
+    # reads the bound field cleanly.
+    def _capture_attr(name, dtype, prev_geo, location):
+        na = _add_node(nodes, 'GeometryNodeInputNamedAttribute',
+                       f"CapIn_{name}", (location[0] - 200, location[1]))
+        na.data_type = dtype
+        na.inputs['Name'].default_value = name
+        cap = _add_node(nodes, 'GeometryNodeCaptureAttribute',
+                        f"Capture_{name}", location)
+        cap.domain = 'POINT'
+        # Blender 4.2+ Capture Attribute uses dynamic sockets. Add the capture
+        # item with chosen data type.
+        if hasattr(cap, 'capture_items'):
+            cap.capture_items.new(dtype, name)
+            cap_value_input = cap.inputs[1]   # first dynamic input after Geometry
+            cap_value_output = cap.outputs[1] # first dynamic output after Geometry
+        else:
+            cap.data_type = dtype
+            cap_value_input = cap.inputs['Value']
+            cap_value_output = cap.outputs[1]
+        _link(links, prev_geo, cap.inputs['Geometry'])
+        _link(links, na.outputs['Attribute'], cap_value_input)
+        return cap.outputs['Geometry'], cap_value_output
+
+    geo_cap = rep_markers_socket
+    geo_cap, cap_rep_radius = _capture_attr(
+        "rep_radius", 'FLOAT', geo_cap, (x + 100, y - 260),
     )
+    geo_cap, cap_torpedo_min = _capture_attr(
+        "torpedo_min", 'FLOAT', geo_cap, (x + 100, y - 140),
+    )
+    geo_cap, cap_torpedo_max = _capture_attr(
+        "torpedo_max", 'FLOAT', geo_cap, (x + 100, y - 60),
+    )
+
+    def _sample_at_iter(value_socket, dtype, label, location):
+        si = _add_node(nodes, 'GeometryNodeSampleIndex', label, location)
+        si.data_type = dtype
+        si.domain = 'POINT'
+        _link(links, geo_cap, si.inputs['Geometry'])
+        _link(links, value_socket, si.inputs['Value'])
+        _link(links, ri.outputs['Iteration'], si.inputs['Index'])
+        return si.outputs['Value']
+
+    rep_pos = _sample_at_iter(
+        rep_pos_in.outputs['Position'], 'FLOAT_VECTOR',
+        "SampleRepPos_Point", (x + 400, y - 380),
+    )
+    rep_radius_socket = _sample_at_iter(
+        cap_rep_radius, 'FLOAT', "SampleRepRadius", (x + 400, y - 260),
+    )
+    torpedo_min_val = _sample_at_iter(
+        cap_torpedo_min, 'FLOAT', "SampleTorpMin", (x + 400, y - 140),
+    )
+    torpedo_max_val = _sample_at_iter(
+        cap_torpedo_max, 'FLOAT', "SampleTorpMax", (x + 400, y - 60),
+    )
+
+    # affects = (torpedo_idx >= torpedo_min - 0.5) AND (torpedo_idx <= torpedo_max + 0.5)
+    ge_min = _add_math_node(nodes, 'GREATER_THAN', "GeMin", (x + 600, y - 100))
+    # GREATER_THAN is strict; add 0.5 tolerance on other side: idx >= min ⇔ idx > min - 0.5
+    min_minus = _add_math_node(nodes, 'SUBTRACT', "MinMinus", (x + 500, y - 100))
+    min_minus.inputs[1].default_value = 0.5
+    _link(links, torpedo_min_val, min_minus.inputs[0])
+    _link(links, torpedo_idx_socket, ge_min.inputs[0])
+    _link(links, min_minus.outputs[0], ge_min.inputs[1])
+
+    le_max = _add_math_node(nodes, 'LESS_THAN', "LeMax", (x + 600, y - 40))
+    max_plus = _add_math_node(nodes, 'ADD', "MaxPlus", (x + 500, y - 40))
+    max_plus.inputs[1].default_value = 0.5
+    _link(links, torpedo_max_val, max_plus.inputs[0])
+    _link(links, torpedo_idx_socket, le_max.inputs[0])
+    _link(links, max_plus.outputs[0], le_max.inputs[1])
+
+    affects = _add_math_node(nodes, 'MULTIPLY', "Affects", (x + 800, y - 70))
+    _link(links, ge_min.outputs[0], affects.inputs[0])
+    _link(links, le_max.outputs[0], affects.inputs[1])
 
     # to_rep, dist, to_rep_norm
     to_rep = _add_vmath_node(nodes, 'SUBTRACT', "ToRep", (x + 600, y))
@@ -536,14 +698,18 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
     _link(links, rep_far_from_tgt.outputs[0], rep_gate.inputs[0])
     _link(links, torp_far_from_tgt.outputs[0], rep_gate.inputs[1])
 
-    # active = approaching * in_range * rep_gate
+    # active = approaching * in_range * rep_gate * affects
     act_ab = _add_math_node(nodes, 'MULTIPLY', "ActAB", (x + 1400, y + 50))
     _link(links, approaching.outputs[0], act_ab.inputs[0])
     _link(links, in_range.outputs[0], act_ab.inputs[1])
 
-    active = _add_math_node(nodes, 'MULTIPLY', "ActFull", (x + 1400, y - 50))
-    _link(links, act_ab.outputs[0], active.inputs[0])
-    _link(links, rep_gate.outputs[0], active.inputs[1])
+    act_abg = _add_math_node(nodes, 'MULTIPLY', "ActABG", (x + 1400, y - 50))
+    _link(links, act_ab.outputs[0], act_abg.inputs[0])
+    _link(links, rep_gate.outputs[0], act_abg.inputs[1])
+
+    active = _add_math_node(nodes, 'MULTIPLY', "ActFull", (x + 1500, y - 50))
+    _link(links, act_abg.outputs[0], active.inputs[0])
+    _link(links, affects.outputs[0], active.inputs[1])
 
     # tangent = vel - dot(vel, to_rep_norm) * to_rep_norm
     vel_dot_n = _add_vmath_node(nodes, 'DOT_PRODUCT', "VelDotN", (x + 1000, y + 300))
@@ -666,11 +832,17 @@ def _build_repulsor_forces(nodes, links, position_socket, velocity_socket,
     _link(links, brake_approaching.outputs[0], brake_ab.inputs[0])
     _link(links, in_brake_range.outputs[0], brake_ab.inputs[1])
 
-    brake_full = _add_math_node(
-        nodes, 'MULTIPLY', "BrakeFull", (x + 1500, y - 400),
+    brake_abg = _add_math_node(
+        nodes, 'MULTIPLY', "BrakeABG", (x + 1500, y - 400),
     )
-    _link(links, brake_ab.outputs[0], brake_full.inputs[0])
-    _link(links, rep_gate.outputs[0], brake_full.inputs[1])
+    _link(links, brake_ab.outputs[0], brake_abg.inputs[0])
+    _link(links, rep_gate.outputs[0], brake_abg.inputs[1])
+
+    brake_full = _add_math_node(
+        nodes, 'MULTIPLY', "BrakeFull", (x + 1550, y - 400),
+    )
+    _link(links, brake_abg.outputs[0], brake_full.inputs[0])
+    _link(links, affects.outputs[0], brake_full.inputs[1])
 
     brake_active = _add_math_node(
         nodes, 'GREATER_THAN', "BrakeActive", (x + 1600, y - 400),
@@ -1199,8 +1371,41 @@ def build_torpedo_effect():
         nodes, links, group_in.outputs['Repulsors'], "REP_CI", (-1200, -1200),
     )
 
+    # Realize repulsors + filter to marker verts (rep_marker == 1.0).
+    # After filter: 1 vertex per repulsor with per-rep attributes attached.
+    rep_realize = _add_node(
+        nodes, 'GeometryNodeRealizeInstances', "REP_Realize", (-1100, -1200),
+    )
+    _link(links, rep_instances, rep_realize.inputs['Geometry'])
+
+    rep_marker_attr_in = _add_node(
+        nodes, 'GeometryNodeInputNamedAttribute', "REP_MarkerAttrIn", (-1100, -1100),
+    )
+    rep_marker_attr_in.data_type = 'FLOAT'
+    rep_marker_attr_in.inputs['Name'].default_value = "rep_marker"
+
+    # select = rep_marker < 0.5  (for deletion — we want to keep markers only)
+    not_marker = _add_math_node(
+        nodes, 'LESS_THAN', "NotMarker", (-950, -1100),
+    )
+    not_marker.inputs[1].default_value = 0.5
+    _link(links, rep_marker_attr_in.outputs['Attribute'], not_marker.inputs[0])
+
+    rep_markers = _add_node(
+        nodes, 'GeometryNodeDeleteGeometry', "REP_KeepMarkers", (-950, -1200),
+    )
+    rep_markers.domain = 'POINT'
+    _link(links, rep_realize.outputs['Geometry'], rep_markers.inputs['Geometry'])
+    _link(links, not_marker.outputs[0], rep_markers.inputs['Selection'])
+
     lp_count = _instance_count(nodes, links, lp_instances, "LP_Count", (-1000, -400))
-    rep_count = _instance_count(nodes, links, rep_instances, "REP_Count", (-1000, -1200))
+    # rep_count now = surviving marker vert count on filtered mesh (POINT domain)
+    rep_count_node = _add_node(
+        nodes, 'GeometryNodeAttributeDomainSize', "REP_Count", (-800, -1200),
+    )
+    rep_count_node.component = 'MESH'
+    _link(links, rep_markers.outputs['Geometry'], rep_count_node.inputs['Geometry'])
+    rep_count = rep_count_node.outputs['Point Count']
     tgt_count = _instance_count(nodes, links, tgt_instances, "TGT_Count", (-1000, -800))
 
     # Torpedo point count = lp_count * SLOTS_PER_LP. Each LP gets SLOTS_PER_LP
@@ -1436,10 +1641,10 @@ def build_torpedo_effect():
         velocity_socket=impulse_vel_socket,
         target_pos_socket=target_pos_socket,
         dist_to_target_socket=dist_to_target_pre.outputs['Value'],
-        rep_instances_socket=rep_instances,
+        rep_markers_socket=rep_markers.outputs['Geometry'],
         rep_count_socket=rep_count,
+        torpedo_idx_socket=target_idx_socket.outputs[0],
         rep_strength_socket=sim_in.outputs['RepStrParam'],
-        rep_radius_socket=sim_in.outputs['RepRadParam'],
         safety_margin_socket=sim_in.outputs['SafeMarginParam'],
         steering_range_socket=sim_in.outputs['SteerRangeParam'],
         brake_gain_socket=sim_in.outputs['BrakeGainParam'],
@@ -1576,24 +1781,30 @@ def setup_test_scene(num_launchpads=3, num_targets=10):
         empty.location = (500, -250 + i * 55, 40)
         tgt_col.objects.link(empty)
 
-    # Repulsors: placed on direct torpedo→target lines so flight paths
-    # actually intersect envelopes. Envelope radius = Repulsor Radius (80).
+    # Repulsors: per-rep Min/Max/Radius via RepulsorTag modifier.
+    #   rep 0 — affects all torpedoes (0..9999), radius 80
+    #   rep 1 — affects torpedo 1 only, radius 60 (smaller envelope)
+    #   rep 2 — affects none (min>max), torpedoes pass through
     rep_layouts = [
-        ((100, -200, 0),  "mid-path torpedo 0 → TGT.001"),
-        ((200,    0, 0),  "mid-path torpedo 1 → TGT.~"),
-        ((100,  200, 20), "mid-path torpedo 2 → TGT.~"),
+        ((100, -200,  0), 80.0, 0, 9999, "ALL torpedoes"),
+        ((200,    0,  0), 60.0, 1, 1,    "only torpedo 1"),
+        ((100,  200, 20), 100.0, 1, 0,   "passthrough (no torpedo affected)"),
     ]
-    for i, (loc, note) in enumerate(rep_layouts):
+    for i, (loc, vis_radius, vmin, vmax, note) in enumerate(rep_layouts):
         bm = bmesh.new()
-        bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=8, radius=80.0)
+        bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=8, radius=vis_radius)
         mesh = bpy.data.meshes.new(f"REP.{i+1:03d}")
         bm.to_mesh(mesh)
         bm.free()
         obj = bpy.data.objects.new(f"REP.{i+1:03d}", mesh)
         obj.location = loc
         obj.display_type = 'WIRE'
+        # Stash per-rep config on the object for later modifier setup.
+        obj["_test_min"] = float(vmin)
+        obj["_test_max"] = float(vmax)
+        obj["_test_radius"] = float(vis_radius)
         rep_col.objects.link(obj)
-        print(f"  Repulsor REP.{i+1:03d} @ {loc} — {note}")
+        print(f"  Repulsor REP.{i+1:03d} @ {loc} r={vis_radius} — {note}")
 
     print(f"  Test scene: {num_launchpads} launchpads, {num_targets} targets, {len(rep_layouts)} repulsors.")
 
@@ -1616,10 +1827,47 @@ def _assign_modifier_collections(mod, ng, found_collections):
             mod[sock.identifier] = col
 
 
+def _ensure_repulsor_tag_modifiers(rep_col, tag_ng, per_rep_config):
+    """Add RepulsorTag modifier to each rep that lacks one.
+
+    per_rep_config: dict { name: (min, max, radius) } — fills slot values for
+    objects matching the name. Reps not in the dict get defaults.
+    """
+    for obj in rep_col.objects:
+        mod = next((m for m in obj.modifiers
+                    if m.type == 'NODES' and m.node_group == tag_ng), None)
+        if mod is None:
+            mod = obj.modifiers.new(REPULSOR_TAG_NAME, 'NODES')
+            mod.node_group = tag_ng
+        cfg = per_rep_config.get(obj.name)
+        if cfg is not None:
+            vmin, vmax, vr = cfg
+            for s in tag_ng.interface.items_tree:
+                if getattr(s, 'in_out', None) != 'INPUT':
+                    continue
+                if s.name == 'Min Index': mod[s.identifier] = float(vmin)
+                elif s.name == 'Max Index': mod[s.identifier] = float(vmax)
+                elif s.name == 'Radius': mod[s.identifier] = float(vr)
+
+
 def main():
     found = _resolve_collections()
 
     ctrl = _create_controller_mesh()
+    # Build rep tag nodegroup + ensure it's applied to all reps.
+    # Test-scene reps stash their config in object custom properties —
+    # read those to pre-populate modifier slots.
+    tag_ng = build_repulsor_tag_nodegroup()
+    rep_col = found.get(REPULSOR_COLLECTION)
+    if rep_col is not None:
+        per_rep_cfg = {}
+        for obj in rep_col.objects:
+            if "_test_min" in obj.keys():
+                per_rep_cfg[obj.name] = (
+                    obj["_test_min"], obj["_test_max"], obj["_test_radius"],
+                )
+        _ensure_repulsor_tag_modifiers(rep_col, tag_ng, per_rep_cfg)
+
     ng = build_torpedo_effect()
 
     for mod in list(ctrl.modifiers):
